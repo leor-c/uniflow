@@ -215,7 +215,7 @@ def main(cfg: Config | None = None):
         ap.add_argument("--teacher_steps", type=int, default=10000)
         ap.add_argument("--student_steps", type=int, default=10000)
         ap.add_argument("--student_mode", default="jvp", choices=["jvp", "ct"])
-        ap.add_argument("--seed", type=int, default=2)
+        ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
         cfg = Config(

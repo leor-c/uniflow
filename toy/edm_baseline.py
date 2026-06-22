@@ -94,7 +94,7 @@ def train_toy_ae(ae: ToyAE, data_sampler, cfg: Config) -> None:
 class Config:
     dataset: str = "8gaussians"
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
-    seed: int = 2
+    seed: int = 1
 
     # AE
     latent_dim: int = 16
@@ -214,11 +214,11 @@ def main(cfg: Config | None = None):
         ap = argparse.ArgumentParser()
         ap.add_argument("--dataset", default="8gaussians",
                         choices=["8gaussians", "two_moons", "checkerboard"])
-        ap.add_argument("--latent_dim", type=int, default=32)
+        ap.add_argument("--latent_dim", type=int, default=16)
         ap.add_argument("--teacher_steps", type=int, default=10000)
         ap.add_argument("--student_steps", type=int, default=10000)
         ap.add_argument("--student_mode", default="jvp", choices=["jvp", "hybrid"])
-        ap.add_argument("--seed", type=int, default=2)
+        ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
         cfg = Config(
