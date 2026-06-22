@@ -18,15 +18,13 @@ Models:
 
 Losses (differentiable, return scalar):
     rf_teacher_loss
-    endpoint_distillation_loss
     jvp_scm_loss
     jvp_ct_loss          – teacher-free Consistency-Training analog of jvp_scm_loss
-    endpoint_distillation_eval_loss  (no_grad)
+    endpoint_distillation_eval_loss  (no_grad, monitoring only)
 
 Training loops:
     train_teacher
     train_student_jvp
-    train_student_hybrid
     train_student_ct     – teacher-free (CT-style) student training
 
 Sampling (return latent tensors, no decoding):
@@ -161,30 +159,6 @@ def rf_teacher_loss(
     target_v = z1 - z0
     pred_v = teacher(zt, t)
     return F.mse_loss(pred_v, target_v)
-
-
-def endpoint_distillation_loss(
-    student: RFConsistencyStudent,
-    teacher: RFTeacher,
-    latent_sampler: Callable[[int], torch.Tensor],
-    batch_size: int,
-    latent_dim: int,
-    device: str | torch.device,
-    ode_steps: int = 32,
-) -> torch.Tensor:
-    """
-    Flow-map distillation loss:
-        C_theta(z_t, t) ≈ ODESolve_teacher(z_t, t → 1)
-    """
-    with torch.no_grad():
-        z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
-    t = torch.rand(batch_size, 1, device=device).clamp(0.0, 1.0 - 1e-4)
-    zt = (1.0 - t) * z0 + t * z1
-    with torch.no_grad():
-        target = integrate_teacher(teacher, zt, t, steps=ode_steps)
-    pred = student(zt, t)
-    return F.mse_loss(pred, target)
 
 
 @torch.no_grad()
@@ -357,7 +331,7 @@ def train_student_jvp(
     Train the consistency student with the pure JVP loss.
 
     cfg fields used: batch_size, latent_dim, device, student_lr,
-                     student_hybrid_steps, jvp_weight, jvp_dt_ref,
+                     student_steps, jvp_weight, jvp_dt_ref,
                      jvp_clean_bias, jvp_beta_alpha, jvp_beta_beta,
                      jvp_use_time_weight, jvp_time_weight_floor,
                      endpoint_ode_steps, log_every.
@@ -366,7 +340,7 @@ def train_student_jvp(
     teacher.eval()
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.student_lr)
 
-    for step in range(1, cfg.student_hybrid_steps + 1):
+    for step in range(1, cfg.student_steps + 1):
         loss_jvp = jvp_scm_loss(
             student=student,
             teacher=teacher,
@@ -417,7 +391,7 @@ def train_student_ct(
     for training.
 
     cfg fields used: batch_size, latent_dim, device, student_lr,
-                     student_hybrid_steps, jvp_weight, jvp_dt_ref,
+                     student_steps, jvp_weight, jvp_dt_ref,
                      jvp_clean_bias, jvp_beta_alpha, jvp_beta_beta,
                      jvp_use_time_weight, jvp_time_weight_floor,
                      endpoint_ode_steps, log_every.
@@ -430,7 +404,7 @@ def train_student_ct(
         teacher.eval()
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.student_lr)
 
-    for step in range(1, cfg.student_hybrid_steps + 1):
+    for step in range(1, cfg.student_steps + 1):
         loss_jvp = jvp_ct_loss(
             student=student,
             latent_sampler=latent_sampler,
@@ -463,109 +437,6 @@ def train_student_ct(
                 ).item()
                 msg += f" | eval endpoint {eval_ep:.6f}"
             print(msg)
-
-    student.eval()
-
-
-def train_student_hybrid(
-    student: RFConsistencyStudent,
-    teacher: RFTeacher,
-    latent_sampler: Callable[[int], torch.Tensor],
-    cfg,
-) -> None:
-    """
-    Train the consistency student with a hybrid endpoint-anchor / JVP schedule.
-
-    Every cfg.endpoint_every steps: endpoint distillation loss (+ optional JVP).
-    All other steps: pure JVP loss.
-
-    cfg fields used: same as train_student_jvp, plus student_endpoint_warmup_steps,
-                     student_hybrid_steps, endpoint_every, anchor_jvp_weight.
-    """
-    student.train()
-    teacher.eval()
-    opt = torch.optim.AdamW(student.parameters(), lr=cfg.student_lr)
-
-    # Optional endpoint-only warmup
-    for step in range(1, cfg.student_endpoint_warmup_steps + 1):
-        loss = endpoint_distillation_loss(
-            student, teacher, latent_sampler,
-            cfg.batch_size, cfg.latent_dim, cfg.device,
-            ode_steps=cfg.endpoint_ode_steps,
-        )
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        if step % cfg.log_every == 0:
-            print(f"[student warmup] step {step:05d} | endpoint {loss.item():.6f}")
-
-    for step in range(1, cfg.student_hybrid_steps + 1):
-        do_endpoint = (step == 1) or (step % cfg.endpoint_every == 0)
-
-        if do_endpoint:
-            loss_ep = endpoint_distillation_loss(
-                student, teacher, latent_sampler,
-                cfg.batch_size, cfg.latent_dim, cfg.device,
-                ode_steps=cfg.endpoint_ode_steps,
-            )
-            loss = loss_ep
-            ep_val = loss_ep.item()
-            jvp_val = float("nan")
-
-            if cfg.anchor_jvp_weight != 0.0:
-                loss_jvp = jvp_scm_loss(
-                    student, teacher, latent_sampler,
-                    cfg.batch_size, cfg.latent_dim, cfg.device,
-                    jvp_dt_ref=cfg.jvp_dt_ref,
-                    jvp_clean_bias=cfg.jvp_clean_bias,
-                    jvp_beta_alpha=cfg.jvp_beta_alpha,
-                    jvp_beta_beta=cfg.jvp_beta_beta,
-                    jvp_use_time_weight=cfg.jvp_use_time_weight,
-                    jvp_time_weight_floor=cfg.jvp_time_weight_floor,
-                )
-                loss = loss + cfg.anchor_jvp_weight * loss_jvp
-                jvp_val = loss_jvp.item()
-            mode = "endpoint" if cfg.anchor_jvp_weight == 0.0 else "endpoint+jvp"
-
-        else:
-            if cfg.jvp_weight == 0.0:
-                continue
-            loss_jvp = jvp_scm_loss(
-                student, teacher, latent_sampler,
-                cfg.batch_size, cfg.latent_dim, cfg.device,
-                jvp_dt_ref=cfg.jvp_dt_ref,
-                jvp_clean_bias=cfg.jvp_clean_bias,
-                jvp_beta_alpha=cfg.jvp_beta_alpha,
-                jvp_beta_beta=cfg.jvp_beta_beta,
-                jvp_use_time_weight=cfg.jvp_use_time_weight,
-                jvp_time_weight_floor=cfg.jvp_time_weight_floor,
-            )
-            loss = cfg.jvp_weight * loss_jvp
-            ep_val = float("nan")
-            jvp_val = loss_jvp.item()
-            mode = "jvp"
-
-        if not torch.isfinite(loss):
-            raise RuntimeError(
-                f"Non-finite student loss at step {step}: "
-                f"endpoint={ep_val:.6f} jvp={jvp_val:.6f}"
-            )
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-        if step % cfg.log_every == 0:
-            eval_ep = endpoint_distillation_eval_loss(
-                student, teacher, latent_sampler,
-                cfg.batch_size, cfg.latent_dim, cfg.device,
-                ode_steps=cfg.endpoint_ode_steps,
-            ).item()
-            print(
-                f"[student {mode}] step {step:05d} | "
-                f"loss {loss.item():.6f} | endpoint {ep_val:.6f} | "
-                f"jvp {jvp_val:.6f} | eval endpoint {eval_ep:.6f}"
-            )
 
     student.eval()
 

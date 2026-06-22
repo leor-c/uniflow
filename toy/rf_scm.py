@@ -119,12 +119,9 @@ class Config:
 
     # RF-sCM student
     student_lr: float = 1e-3
-    student_endpoint_warmup_steps: int = 0
-    student_hybrid_steps: int = 10000
+    student_steps: int = 10000
     endpoint_ode_steps: int = 32
-    endpoint_every: int = 40
     jvp_weight: float = 1.0
-    anchor_jvp_weight: float = 0.001
     jvp_dt_ref: float = 1.0
     jvp_clean_bias: bool = False
     jvp_beta_alpha: float = 2.0
@@ -136,7 +133,7 @@ class Config:
     batch_size: int = 64
     teacher_sample_steps: int = 64
     student_sample_k: int = 8
-    student_mode: str = "jvp"   # "jvp" | "hybrid" | "ct"
+    student_mode: str = "jvp"   # "jvp" | "ct"
 
     log_every: int = 500
     out: str = "rf_scm_toy.png"
@@ -217,7 +214,7 @@ def main(cfg: Config | None = None):
         ap.add_argument("--latent_dim", type=int, default=32)
         ap.add_argument("--teacher_steps", type=int, default=10000)
         ap.add_argument("--student_steps", type=int, default=10000)
-        ap.add_argument("--student_mode", default="jvp", choices=["jvp", "hybrid", "ct"])
+        ap.add_argument("--student_mode", default="jvp", choices=["jvp", "ct"])
         ap.add_argument("--seed", type=int, default=2)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
@@ -225,7 +222,7 @@ def main(cfg: Config | None = None):
             dataset=args.dataset,
             latent_dim=args.latent_dim,
             teacher_steps=args.teacher_steps,
-            student_hybrid_steps=args.student_steps,
+            student_steps=args.student_steps,
             student_mode=args.student_mode,
             seed=args.seed,
             out=args.out or f"rf_scm_{args.dataset}.png",
@@ -257,8 +254,6 @@ def main(cfg: Config | None = None):
     print(f"\nTraining RF-sCM student ({cfg.student_mode})...")
     if cfg.student_mode == "jvp":
         R.train_student_jvp(student, teacher, latent_sampler, cfg)
-    elif cfg.student_mode == "hybrid":
-        R.train_student_hybrid(student, teacher, latent_sampler, cfg)
     elif cfg.student_mode == "ct":
         R.train_student_ct(student, latent_sampler, cfg, teacher=teacher)
     else:
