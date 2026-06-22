@@ -25,9 +25,9 @@ class RFTeacher(nn.Module):
     """
 
     def __init__(self, latent_dim: int, hidden: int = 128, depth: int = 4,
-                 num_freq: int = 4, max_freq: float = 4.0):
+                 num_freq: int = 64, max_freq: float = 12.0):
         super().__init__()
-        self.time_embed = FourierTimeEmbedding(num_freq, max_freq)
+        self.time_embed = FourierTimeEmbedding(num_freq, max_freq, log_scale=True)
         self.mlp = MLP(latent_dim + self.time_embed.dim, latent_dim, hidden=hidden, depth=depth)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:

@@ -21,9 +21,11 @@ class FourierTimeEmbedding(nn.Module):
     frequencies create extremely stiff gradients w.r.t. t and destabilise training.
     """
 
-    def __init__(self, num_frequencies: int = 4, max_freq: float = 4.0):
+    def __init__(self, num_frequencies: int = 4, max_freq: float = 4.0, log_scale: bool = False):
         super().__init__()
         freqs = torch.linspace(1.0, max_freq, num_frequencies).float()
+        if log_scale:
+            freqs = freqs.exp()
         self.register_buffer("freqs", freqs)
 
     @property
