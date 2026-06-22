@@ -143,13 +143,13 @@ class Config:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_data_sampler(dataset: str, device):
+def make_data_sampler(dataset: str, device):
     if dataset == "8gaussians":
         return lambda n: sample_8gaussians(n, device)
     return get_sampler(dataset, device=device)
 
 
-def _make_latent_sampler(ae: ToyAE, data_sampler, device):
+def make_latent_sampler(ae: ToyAE, data_sampler, device):
     @torch.no_grad()
     def sampler(batch_size: int) -> torch.Tensor:
         x = data_sampler(batch_size)
@@ -231,7 +231,7 @@ def main(cfg: Config | None = None):
     print(cfg)
     torch.manual_seed(cfg.seed)
 
-    data_sampler = _make_data_sampler(cfg.dataset, cfg.device)
+    data_sampler = make_data_sampler(cfg.dataset, cfg.device)
 
     # AE (original architecture)
     ae = ToyAE(
@@ -242,7 +242,7 @@ def main(cfg: Config | None = None):
     print("\nTraining autoencoder...")
     train_toy_ae(ae, data_sampler, cfg)
 
-    latent_sampler = _make_latent_sampler(ae, data_sampler, cfg.device)
+    latent_sampler = make_latent_sampler(ae, data_sampler, cfg.device)
 
     # Teacher
     teacher = R.RFTeacher(cfg.latent_dim, cfg.hidden, cfg.depth).to(cfg.device)
