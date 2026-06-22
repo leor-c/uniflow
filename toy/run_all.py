@@ -2,14 +2,14 @@
 Run all three toy experiments back to back: AYF interval flow map, RF-sCM,
 and the EDM baseline.
 
-Each experiment uses its own default Config. The --seed, --ae_steps,
---student_steps, and --teacher_steps flags are applied on top of those
-defaults only when explicitly passed; any flag left unset keeps each
-experiment's own default for that field.
+Each experiment uses its own default Config. The --dataset, --seed,
+--ae_steps, --student_steps, and --teacher_steps flags are applied on top
+of those defaults only when explicitly passed; any flag left unset keeps
+each experiment's own default for that field.
 
 Usage:
     python -m urfm.toy.run_all
-    python -m urfm.toy.run_all --seed 0 --teacher_steps 2000 --student_steps 2000
+    python -m urfm.toy.run_all --dataset two_moons --seed 0 --teacher_steps 2000 --student_steps 2000
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ from toy import ayf_rf, rf_scm, edm_baseline
 
 
 def _apply_overrides(cfg, args, *, teacher_field: str, student_field: str):
+    if args.dataset is not None:
+        cfg.dataset = args.dataset
     if args.seed is not None:
         cfg.seed = args.seed
     if args.ae_steps is not None:
@@ -33,6 +35,8 @@ def _apply_overrides(cfg, args, *, teacher_field: str, student_field: str):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", default=None,
+                     choices=["8gaussians", "two_moons", "checkerboard"])
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--ae_steps", type=int, default=None)
     ap.add_argument("--teacher_steps", type=int, default=None)

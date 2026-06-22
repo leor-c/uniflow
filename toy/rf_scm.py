@@ -136,7 +136,7 @@ class Config:
     student_mode: str = "jvp"   # "jvp" | "ct"
 
     log_every: int = 500
-    out: str = "rf_scm_toy.png"
+    out: str = "rf_scm-{}.png"
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +198,8 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
         ax.set_aspect("equal")
         ax.grid(True, linewidth=0.3)
     plt.tight_layout()
-    plt.savefig(cfg.out, dpi=160)
-    print(f"Saved → {cfg.out}")
+    plt.savefig(cfg.out.format(cfg.dataset), dpi=160)
+    print(f"Saved → {cfg.out.format(cfg.dataset)}")
 
 
 # ---------------------------------------------------------------------------

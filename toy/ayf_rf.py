@@ -73,7 +73,7 @@ class Config:
     sample_clamp: bool = False
 
     log_every: int = 500
-    out: str = "ayf_rf_toy.png"
+    out: str = "ayf_rf-{}.png"
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +118,8 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
         ax.set_aspect("equal")
         ax.grid(True, linewidth=0.3)
     plt.tight_layout()
-    plt.savefig(cfg.out, dpi=160)
-    print(f"Saved → {cfg.out}")
+    plt.savefig(cfg.out.format(cfg.dataset), dpi=160)
+    print(f"Saved → {cfg.out.format(cfg.dataset)}")
 
 
 # ---------------------------------------------------------------------------
