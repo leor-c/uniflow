@@ -7,9 +7,6 @@ Convention (t=0 → noise, t=1 → data):
     z_t = (1 - t) * z0 + t * z1    t in [0, 1]
     teacher velocity target: v = z1 - z0
 
-This is the OPPOSITE convention from core.interp (which has t=0 → data).
-The code in this module is self-contained w.r.t. convention.
-
 Public API
 ----------
 Models:
@@ -37,7 +34,6 @@ Sampling (return latent tensors, no decoding):
 
 from __future__ import annotations
 
-import math
 from typing import Callable
 
 import torch
@@ -181,6 +177,67 @@ def endpoint_distillation_eval_loss(
     return F.mse_loss(pred, target)
 
 
+def _sample_zt(
+    latent_sampler: Callable[[int], torch.Tensor],
+    batch_size: int,
+    latent_dim: int,
+    device: str | torch.device,
+    jvp_clean_bias: bool,
+    jvp_beta_alpha: float,
+    jvp_beta_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared (z0, z1, z_t, t) sampling for the continuous-time JVP losses."""
+    with torch.no_grad():
+        z1 = latent_sampler(batch_size)
+    z0 = sample_noise(batch_size, latent_dim, device)
+
+    if jvp_clean_bias:
+        t = torch.distributions.Beta(
+            torch.tensor(jvp_beta_alpha, device=device),
+            torch.tensor(jvp_beta_beta, device=device),
+        ).sample((batch_size, 1))
+    else:
+        t = torch.rand(batch_size, 1, device=device)
+    t = t.clamp(1e-4, 1.0 - 1e-4)
+
+    zt = (1.0 - t) * z0 + t * z1
+    return z0, z1, zt, t
+
+
+def _jvp_consistency_loss(
+    student: RFConsistencyStudent,
+    zt: torch.Tensor,
+    t: torch.Tensor,
+    v: torch.Tensor,
+    jvp_dt_ref: float,
+    jvp_use_time_weight: bool,
+    jvp_time_weight_floor: float,
+) -> torch.Tensor:
+    """
+    Shared continuous-time consistency residual.
+
+    Enforces d/dt C(z(t), t) = 0 along dz/dt = v:
+
+        d/dt C(z, t) = ∂_t C(z, t) + J_z C(z, t) · v = 0
+
+    Computed as a single forward-mode JVP of C w.r.t. (z, t) with tangent (v, 1).
+    """
+    _, tangent = jvp(
+        lambda z_in, t_in: student(z_in, t_in),
+        primals=(zt, t),
+        tangents=(v, torch.ones_like(t)),
+    )
+
+    norm = torch.sqrt(1.0 + v.pow(2).mean(dim=-1, keepdim=True)).detach()
+    residual = tangent / norm
+
+    if jvp_use_time_weight:
+        weight = 1.0 / (1.0 - t).clamp_min(jvp_time_weight_floor)
+        return (weight * residual.pow(2)).mean()
+
+    return (jvp_dt_ref ** 2) * residual.pow(2).mean()
+
+
 def jvp_scm_loss(
     student: RFConsistencyStudent,
     teacher: RFTeacher,
@@ -196,45 +253,19 @@ def jvp_scm_loss(
     jvp_time_weight_floor: float = 0.05,
 ) -> torch.Tensor:
     """
-    Continuous-time RF-sCM / JVP loss.
-
-    Enforces d/dt C(z(t), t) = 0 along the teacher ODE dz/dt = v(z, t):
-
-        d/dt C(z, t) = ∂_t C(z, t) + J_z C(z, t) · v(z, t) = 0
-
-    Computed as a single forward-mode JVP of C w.r.t. (z, t) with tangent (v, 1).
+    Continuous-time RF-sCM / JVP loss. The tangent direction v is the
+    pretrained teacher's marginal velocity prediction at z_t. See
+    _jvp_consistency_loss for the consistency condition being enforced.
     """
-    with torch.no_grad():
-        z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
-
-    if jvp_clean_bias:
-        t = torch.distributions.Beta(
-            torch.tensor(jvp_beta_alpha, device=device),
-            torch.tensor(jvp_beta_beta, device=device),
-        ).sample((batch_size, 1))
-    else:
-        t = torch.rand(batch_size, 1, device=device)
-    t = t.clamp(1e-4, 1.0 - 1e-4)
-
-    zt = (1.0 - t) * z0 + t * z1
+    _, _, zt, t = _sample_zt(
+        latent_sampler, batch_size, latent_dim, device,
+        jvp_clean_bias, jvp_beta_alpha, jvp_beta_beta,
+    )
     with torch.no_grad():
         v = teacher(zt, t)
-
-    _, tangent = jvp(
-        lambda z_in, t_in: student(z_in, t_in),
-        primals=(zt, t),
-        tangents=(v, torch.ones_like(t)),
+    return _jvp_consistency_loss(
+        student, zt, t, v, jvp_dt_ref, jvp_use_time_weight, jvp_time_weight_floor
     )
-
-    norm = torch.sqrt(1.0 + v.pow(2).mean(dim=-1, keepdim=True)).detach()
-    residual = tangent / norm
-
-    if jvp_use_time_weight:
-        weight = 1.0 / (1.0 - t).clamp_min(jvp_time_weight_floor)
-        return (weight * residual.pow(2)).mean()
-
-    return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
 def jvp_ct_loss(
@@ -253,43 +284,20 @@ def jvp_ct_loss(
     """
     Consistency-Training (CT) analog of jvp_scm_loss — no teacher network.
 
-    Same continuous-time consistency condition as jvp_scm_loss,
-        d/dt C(z_t, t) = ∂_t C + J_z C · v = 0,
-    but the tangent direction v is the per-sample straight-line velocity
-    z1 - z0 (a single-sample estimate of E[z1 - z0 | z_t]) rather than a
-    pretrained teacher's marginal velocity prediction. This removes the need
-    to train an RFTeacher before training the student.
+    The tangent direction v is the per-sample straight-line velocity z1 - z0
+    (a single-sample estimate of E[z1 - z0 | z_t]) rather than a pretrained
+    teacher's marginal velocity prediction. This removes the need to train
+    an RFTeacher before training the student. See _jvp_consistency_loss for
+    the consistency condition being enforced.
     """
-    with torch.no_grad():
-        z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
-
-    if jvp_clean_bias:
-        t = torch.distributions.Beta(
-            torch.tensor(jvp_beta_alpha, device=device),
-            torch.tensor(jvp_beta_beta, device=device),
-        ).sample((batch_size, 1))
-    else:
-        t = torch.rand(batch_size, 1, device=device)
-    t = t.clamp(1e-4, 1.0 - 1e-4)
-
-    zt = (1.0 - t) * z0 + t * z1
-    v = z1 - z0
-
-    _, tangent = jvp(
-        lambda z_in, t_in: student(z_in, t_in),
-        primals=(zt, t),
-        tangents=(v, torch.ones_like(t)),
+    z0, z1, zt, t = _sample_zt(
+        latent_sampler, batch_size, latent_dim, device,
+        jvp_clean_bias, jvp_beta_alpha, jvp_beta_beta,
     )
-
-    norm = torch.sqrt(1.0 + v.pow(2).mean(dim=-1, keepdim=True)).detach()
-    residual = tangent / norm
-
-    if jvp_use_time_weight:
-        weight = 1.0 / (1.0 - t).clamp_min(jvp_time_weight_floor)
-        return (weight * residual.pow(2)).mean()
-
-    return (jvp_dt_ref ** 2) * residual.pow(2).mean()
+    v = z1 - z0
+    return _jvp_consistency_loss(
+        student, zt, t, v, jvp_dt_ref, jvp_use_time_weight, jvp_time_weight_floor
+    )
 
 
 # ---------------------------------------------------------------------------
