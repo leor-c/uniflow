@@ -40,8 +40,8 @@ class Config:
     latent_dim: int = 16
     hidden: int = 128
     ae_depth: int = 2
-    ae_steps: int = 3000
-    ae_lr: float = 3e-3
+    ae_steps: int = 5000
+    ae_lr: float = 1e-3
     latent_reg_weight: float = 1e-3
 
     # RF teacher
@@ -51,7 +51,7 @@ class Config:
 
     # AYF interval student
     student_lr: float = 1e-3
-    student_steps: int = 20000
+    student_steps: int = 10000
 
     train_mode: str = "emd"   # "emd" (teacher-based) | "ct" (teacher-free)
     emd_weight: float = 1.0
@@ -59,7 +59,7 @@ class Config:
     pairwise_anchor_weight: float = 0.0
     teacher_interval_anchor_weight: float = 0.0
 
-    jvp_dt_ref: float = 0.02
+    jvp_dt_ref: float = 1  # 0.02
     time_eps: float = 1e-4
 
     interval_teacher_ode_steps: int = 16
@@ -68,7 +68,7 @@ class Config:
 
     # Sampling / visualisation
     batch_size: int = 64
-    sample_k: int = 4
+    sample_k: int = 8
     sample_schedule: str = "uniform"
     sample_clamp: bool = False
 
@@ -133,20 +133,21 @@ def main(cfg: Config | None = None):
                         choices=["8gaussians", "two_moons", "checkerboard"])
         ap.add_argument("--latent_dim", type=int, default=16)
         ap.add_argument("--teacher_steps", type=int, default=10000)
-        ap.add_argument("--student_steps", type=int, default=20000)
+        ap.add_argument("--student_steps", type=int, default=10000)
         ap.add_argument("--train_mode", default="emd", choices=["emd", "ct"])
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
         cfg = Config(
             dataset=args.dataset,
-            latent_dim=args.latent_dim,
-            teacher_steps=args.teacher_steps,
-            student_steps=args.student_steps,
             train_mode=args.train_mode,
             seed=args.seed,
             out=args.out or f"ayf_rf_{args.dataset}.png",
         )
+        if args.teacher_steps is not None:
+            cfg.teacher_steps = args.teacher_steps
+        if args.student_steps is not None:
+            cfg.student_steps = args.student_steps
 
     print(cfg)
     torch.manual_seed(cfg.seed)

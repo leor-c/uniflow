@@ -97,7 +97,7 @@ class Config:
     seed: int = 2
 
     # AE
-    latent_dim: int = 32
+    latent_dim: int = 16
     hidden: int = 128
     ae_depth: int = 2
     ae_steps: int = 5000
@@ -223,13 +223,14 @@ def main(cfg: Config | None = None):
         args = ap.parse_args()
         cfg = Config(
             dataset=args.dataset,
-            latent_dim=args.latent_dim,
-            edm_teacher_steps=args.teacher_steps,
-            edm_student_steps=args.student_steps,
             train_edm_student_mode=args.student_mode,
             seed=args.seed,
             out=args.out or f"edm_baseline_{args.dataset}.png",
         )
+        if args.teacher_steps is not None:
+            cfg.teacher_steps = args.teacher_steps
+        if args.student_steps is not None:
+            cfg.student_steps = args.student_steps
 
     print(cfg)
     torch.manual_seed(cfg.seed)
