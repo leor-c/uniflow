@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..modules import FourierTimeEmbedding, MLP
+from ..modules import FourierTimeEmbedding, FiLMMLP
 
 
 class EDMPrecondDenoiser(nn.Module):
@@ -29,15 +29,13 @@ class EDMPrecondDenoiser(nn.Module):
         hidden: int = 128,
         depth: int = 4,
         sigma_data: float = 0.5,
-        num_freq: int = 4,
-        max_freq: float = 4.0,
+        num_freq: int = 64,
+        max_freq: float = 32.0,
     ):
         super().__init__()
         self.sigma_data = float(sigma_data)
         self.noise_embed = FourierTimeEmbedding(num_freq, max_freq)
-        self.mlp = MLP(
-            latent_dim + self.noise_embed.dim, latent_dim, hidden=hidden, depth=depth
-        )
+        self.mlp = FiLMMLP(latent_dim, self.noise_embed.dim, latent_dim, hidden=hidden, depth=depth)
 
     def forward(self, z: torch.Tensor, log_sigma: torch.Tensor) -> torch.Tensor:
         if log_sigma.ndim == 1:
@@ -54,5 +52,5 @@ class EDMPrecondDenoiser(nn.Module):
         c_noise = 0.25 * log_sigma
 
         emb = self.noise_embed(c_noise)
-        h = self.mlp(torch.cat([c_in * z, emb], dim=-1))
+        h = self.mlp(c_in * z, emb)
         return c_skip * z + c_out * h

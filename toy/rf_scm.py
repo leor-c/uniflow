@@ -131,7 +131,7 @@ class Config:
 
     # Sampling / visualisation
     batch_size: int = 64
-    teacher_sample_steps: int = 64
+    teacher_sample_steps: int = 256
     student_sample_k: int = 8
     student_mode: str = "jvp"   # "jvp" | "ct"
 

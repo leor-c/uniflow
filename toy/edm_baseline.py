@@ -97,10 +97,10 @@ class Config:
     seed: int = 1
 
     # AE
-    latent_dim: int = 16
+    latent_dim: int = 32
     hidden: int = 128
     ae_depth: int = 2
-    ae_steps: int = 5000
+    ae_steps: int = 20000
     ae_lr: float = 1e-3
     latent_reg_weight: float = 1e-3
 
@@ -129,7 +129,7 @@ class Config:
 
     # Sampling / visualisation
     batch_size: int = 64
-    edm_teacher_sample_steps: int = 64
+    edm_teacher_sample_steps: int = 256
     edm_student_sample_k: int = 8
 
     log_every: int = 500

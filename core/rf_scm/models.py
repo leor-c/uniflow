@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..modules import FourierTimeEmbedding, MLP
+from ..modules import FourierTimeEmbedding, FiLMMLP
 
 
 class RFTeacher(nn.Module):
@@ -22,19 +22,22 @@ class RFTeacher(nn.Module):
 
     Regresses v = z1 - z0 along the straight-line path z_t = (1-t)z0 + t*z1.
     Input convention: t=0 is noise, t=1 is data.
+
+    Time conditioning is FiLM-style (per-layer scale/shift from the time
+    embedding) rather than concatenation.
     """
 
     def __init__(self, latent_dim: int, hidden: int = 128, depth: int = 4,
-                 num_freq: int = 64, max_freq: float = 12.0):
+                 num_freq: int = 64, max_freq: float = 32.0):
         super().__init__()
-        self.time_embed = FourierTimeEmbedding(num_freq, max_freq, log_scale=True)
-        self.mlp = MLP(latent_dim + self.time_embed.dim, latent_dim, hidden=hidden, depth=depth)
+        self.time_embed = FourierTimeEmbedding(num_freq, max_freq, log_scale=False)
+        self.mlp = FiLMMLP(latent_dim, self.time_embed.dim, latent_dim, hidden=hidden, depth=depth)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if t.ndim == 1:
             t = t[:, None]
         emb = self.time_embed(t)
-        return self.mlp(torch.cat([z, emb], dim=-1))
+        return self.mlp(z, emb)
 
 
 class RFConsistencyStudent(nn.Module):
@@ -50,14 +53,14 @@ class RFConsistencyStudent(nn.Module):
     """
 
     def __init__(self, latent_dim: int, hidden: int = 128, depth: int = 4,
-                 num_freq: int = 4, max_freq: float = 4.0):
+                 num_freq: int = 64, max_freq: float = 32.0):
         super().__init__()
         self.time_embed = FourierTimeEmbedding(num_freq, max_freq)
-        self.mlp = MLP(latent_dim + self.time_embed.dim, latent_dim, hidden=hidden, depth=depth)
+        self.mlp = FiLMMLP(latent_dim, self.time_embed.dim, latent_dim, hidden=hidden, depth=depth)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if t.ndim == 1:
             t = t[:, None]
         emb = self.time_embed(t)
-        h = self.mlp(torch.cat([z, emb], dim=-1))
+        h = self.mlp(z, emb)
         return t * z + (1.0 - t) * torch.tanh(h)

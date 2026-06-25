@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..modules import FourierTimeEmbedding, MLP
+from ..modules import FourierTimeEmbedding, FiLMMLP
 
 
 class RFIntervalFlowMap(nn.Module):
@@ -30,11 +30,11 @@ class RFIntervalFlowMap(nn.Module):
     """
 
     def __init__(self, latent_dim: int, hidden: int = 128, depth: int = 4,
-                 num_freq: int = 4, max_freq: float = 4.0):
+                 num_freq: int = 64, max_freq: float = 32.0):
         super().__init__()
         self.time_embed = FourierTimeEmbedding(num_freq, max_freq)
         time_dim = 3 * self.time_embed.dim  # emb(t), emb(s), emb(s - t)
-        self.mlp = MLP(latent_dim + time_dim, latent_dim, hidden=hidden, depth=depth)
+        self.mlp = FiLMMLP(latent_dim, time_dim, latent_dim, hidden=hidden, depth=depth)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         if t.ndim == 1:
@@ -47,5 +47,6 @@ class RFIntervalFlowMap(nn.Module):
         emb_s = self.time_embed(s)
         emb_delta = self.time_embed(delta.clamp_min(0.0))
 
-        f = self.mlp(torch.cat([z, emb_t, emb_s, emb_delta], dim=-1))
+        cond = torch.cat([emb_t, emb_s, emb_delta], dim=-1)
+        f = self.mlp(z, cond)
         return z + delta * f
