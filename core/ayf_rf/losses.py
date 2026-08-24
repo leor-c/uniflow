@@ -8,9 +8,8 @@ AYF-style interval flow map losses (differentiable, return scalar unless noted):
     ayf_endpoint_eval_loss         – (no_grad) C(z,t,1) vs teacher ODE to t=1
     ayf_interval_eval_loss         – (no_grad) C(z,t,s) vs teacher ODE to s
 
-See core/ayf_rf/__init__.py and ayf_bounded_latent_rf_summary.md for the
-derivation. EMD reduces to the endpoint RF-sCM/JVP loss (core.rf_scm.jvp_scm_loss)
-when s = 1.
+The EMD loss enforces invariance of the learned interval map along the RF
+teacher trajectory.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.func import jvp
 
-from ..rf_scm import RFTeacher, sample_noise
+from ..rf import RFTeacher, sample_uniform_noise
 from .models import RFIntervalFlowMap
 from .sampling import sample_time_pair_forward, integrate_teacher_interval, integrate_teacher_to_data
 
@@ -46,7 +45,7 @@ def ayf_emd_loss(
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
+    z0 = sample_uniform_noise(batch_size, latent_dim, device)
     t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
     zt = (1.0 - t) * z0 + t * z1
 
@@ -82,7 +81,7 @@ def ayf_emd_ct_loss(
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
+    z0 = sample_uniform_noise(batch_size, latent_dim, device)
     t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
     zt = (1.0 - t) * z0 + t * z1
     v = z1 - z0
@@ -118,7 +117,7 @@ def ayf_lmd_loss(
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
+    z0 = sample_uniform_noise(batch_size, latent_dim, device)
     t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
     zt = (1.0 - t) * z0 + t * z1
 
@@ -153,7 +152,7 @@ def ayf_pairwise_anchor_loss(
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
+    z0 = sample_uniform_noise(batch_size, latent_dim, device)
     t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
     zt = (1.0 - t) * z0 + t * z1
     zs = (1.0 - s) * z0 + s * z1
@@ -179,7 +178,7 @@ def ayf_teacher_interval_anchor_loss(
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
+    z0 = sample_uniform_noise(batch_size, latent_dim, device)
     t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
     zt = (1.0 - t) * z0 + t * z1
 
@@ -202,7 +201,7 @@ def ayf_endpoint_eval_loss(
 ) -> torch.Tensor:
     """Eval-only: C(z_t,t,1) vs teacher ODE target Phi(t -> 1)(z_t)."""
     z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
+    z0 = sample_uniform_noise(batch_size, latent_dim, device)
     t = torch.rand(batch_size, 1, device=device).clamp(time_eps, 1.0 - time_eps)
     s = torch.ones_like(t)
     zt = (1.0 - t) * z0 + t * z1
@@ -224,7 +223,7 @@ def ayf_interval_eval_loss(
 ) -> torch.Tensor:
     """Eval-only: C(z_t,t,s) vs teacher ODE target Phi(t -> s)(z_t)."""
     z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device)
+    z0 = sample_uniform_noise(batch_size, latent_dim, device)
     t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
     zt = (1.0 - t) * z0 + t * z1
     target = integrate_teacher_interval(teacher, zt, t, s, steps=ode_steps)

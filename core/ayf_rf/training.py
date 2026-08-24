@@ -2,8 +2,7 @@
 AYF-style training loop:
     train_student_interval
 
-The RF teacher itself is trained with core.rf_scm.train_teacher (reused
-unchanged) before calling this.
+The RF teacher is trained separately with ``core.rf.train_teacher``.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from typing import Callable
 
 import torch
 
-from ..rf_scm import RFTeacher
+from ..rf import RFTeacher
 from .models import RFIntervalFlowMap
 from .losses import (
     ayf_emd_loss,

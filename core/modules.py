@@ -1,9 +1,7 @@
 """
 Shared neural-network building blocks.
 
-Convention note: the rf_scm / EDM modules use t=0 → noise, t=1 → data,
-which is the OPPOSITE of core.interp (t=0 → data, t=1 → noise).
-These modules are shared across both conventions.
+RF uses t=0 for noise and t=1 for data. EDM is parameterized by log-sigma.
 """
 
 import math

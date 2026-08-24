@@ -1,16 +1,11 @@
 """
-AYF-style interval flow map toy experiment — 2D datasets (8-Gaussians,
-two-moons, checkerboard).
+Uniform-prior, tanh-bounded RF + AYF toy benchmark.
 
-Generalizes toy/rf_scm.py's endpoint consistency student C(z,t) -> z_1 to
-the arbitrary-interval flow map C(z,t,s) -> z_s from core.ayf_rf. The AE and
-RF teacher are unchanged from toy/rf_scm.py and reused directly; see
-ayf_bounded_latent_rf_summary.md for the derivation.
+The RF teacher and AYF student operate in the same compact latent cube.
 
 Usage:
-    python -m urfm.toy.ayf_rf                          # 8gaussians default
-    python -m urfm.toy.ayf_rf --dataset two_moons
-    python -m urfm.toy.ayf_rf --train_mode ct
+    python -m toy.bounded_rf
+    python -m toy.bounded_rf --dataset two_moons
 """
 
 from __future__ import annotations
@@ -19,11 +14,18 @@ import argparse
 from dataclasses import dataclass, field
 
 import torch
-import matplotlib.pyplot as plt
 
-from core import rf_scm as R
+from core import rf as R
 from core import ayf_rf as A
-from toy.rf_scm import ToyAE, train_toy_ae, make_data_sampler, make_latent_sampler
+from toy.common import (
+    ToyAE,
+    make_data_sampler,
+    make_latent_sampler,
+    save_benchmark_figure,
+    save_metrics,
+    sliced_wasserstein_distance,
+    train_toy_ae,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +61,7 @@ class Config:
     pairwise_anchor_weight: float = 0.0
     teacher_interval_anchor_weight: float = 0.0
 
-    jvp_dt_ref: float = 1  # 0.02
+    jvp_dt_ref: float = 1.0
     time_eps: float = 1e-4
 
     interval_teacher_ode_steps: int = 16
@@ -73,7 +75,9 @@ class Config:
     sample_clamp: bool = False
 
     log_every: int = 500
-    out: str = "ayf_rf-{}.png"
+    save_figure: bool = True
+    out: str = "results/bounded_rf_{}.png"
+    metrics_out: str = "results/bounded_rf_{}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -102,24 +106,23 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
     )
     sk = ae.decode(sk_z).cpu()
 
-    fig, axes = plt.subplots(1, 5, figsize=(18, 3.6), sharex=True, sharey=True)
     panels = [
         ("Data", data),
         ("AE recon", x_hat),
-        ("Teacher (ODE)", teacher_samples),
-        ("AYF student 1-step", s1),
-        (f"AYF student {cfg.sample_k}-step", sk),
+        ("Bounded RF (ODE)", teacher_samples),
+        ("Bounded RF + AYF (1-step)", s1),
+        (f"Bounded RF + AYF ({cfg.sample_k}-step)", sk),
     ]
-    for ax, (title, pts) in zip(axes, panels):
-        ax.scatter(pts[:, 0], pts[:, 1], s=2, alpha=0.45)
-        ax.set_title(title)
-        ax.set_xlim(-1.15, 1.15)
-        ax.set_ylim(-1.15, 1.15)
-        ax.set_aspect("equal")
-        ax.grid(True, linewidth=0.3)
-    plt.tight_layout()
-    plt.savefig(cfg.out.format(cfg.dataset), dpi=160)
-    print(f"Saved → {cfg.out.format(cfg.dataset)}")
+    if cfg.save_figure:
+        save_benchmark_figure(panels, cfg.out.format(cfg.dataset))
+    metrics = {
+        "ae_reconstruction_swd": sliced_wasserstein_distance(data, x_hat),
+        "teacher_swd": sliced_wasserstein_distance(data, teacher_samples),
+        "student_1_step_swd": sliced_wasserstein_distance(data, s1),
+        f"student_{cfg.sample_k}_step_swd": sliced_wasserstein_distance(data, sk),
+    }
+    save_metrics(metrics, cfg.metrics_out.format(cfg.dataset))
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -131,18 +134,19 @@ def main(cfg: Config | None = None):
         ap = argparse.ArgumentParser()
         ap.add_argument("--dataset", default="8gaussians",
                         choices=["8gaussians", "two_moons", "checkerboard"])
-        ap.add_argument("--latent_dim", type=int, default=16)
-        ap.add_argument("--teacher_steps", type=int, default=10000)
-        ap.add_argument("--student_steps", type=int, default=10000)
+        ap.add_argument("--latent_dim", type=int, default=32)
+        ap.add_argument("--teacher_steps", type=int, default=None)
+        ap.add_argument("--student_steps", type=int, default=None)
         ap.add_argument("--train_mode", default="emd", choices=["emd", "ct"])
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
         cfg = Config(
             dataset=args.dataset,
+            latent_dim=args.latent_dim,
             train_mode=args.train_mode,
             seed=args.seed,
-            out=args.out or f"ayf_rf_{args.dataset}.png",
+            out=args.out or f"results/bounded_rf_{args.dataset}.png",
         )
         if args.teacher_steps is not None:
             cfg.teacher_steps = args.teacher_steps
@@ -154,18 +158,19 @@ def main(cfg: Config | None = None):
 
     data_sampler = make_data_sampler(cfg.dataset, cfg.device)
 
-    # AE (shared with toy/rf_scm.py)
+    # Tanh-bounded AE
     ae = ToyAE(
         latent_dim=cfg.latent_dim,
         hidden=cfg.hidden,
         depth=cfg.ae_depth,
+        bounded=True,
     ).to(cfg.device)
     print("\nTraining autoencoder...")
     train_toy_ae(ae, data_sampler, cfg)
 
     latent_sampler = make_latent_sampler(ae, data_sampler, cfg.device)
 
-    # RF teacher (shared with toy/rf_scm.py)
+    # RF teacher with a uniform base distribution
     teacher = R.RFTeacher(cfg.latent_dim, cfg.hidden, cfg.depth).to(cfg.device)
     print("\nTraining RF teacher...")
     R.train_teacher(teacher, latent_sampler, cfg)
@@ -176,7 +181,7 @@ def main(cfg: Config | None = None):
     A.train_student_interval(student, teacher, latent_sampler, cfg)
 
     print("\nPlotting...")
-    make_plot(ae, teacher, student, data_sampler, cfg)
+    return make_plot(ae, teacher, student, data_sampler, cfg)
 
 
 if __name__ == "__main__":

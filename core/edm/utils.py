@@ -1,6 +1,4 @@
-"""
-EDM utilities: log-sigma training distribution and the Karras sampling schedule.
-"""
+"""EDM noise-level, normalized-time, and Karras-schedule utilities."""
 
 from __future__ import annotations
 
@@ -37,3 +35,34 @@ def edm_karras_sigmas(
     min_inv = sigma_min ** (1.0 / rho)
     max_inv = sigma_max ** (1.0 / rho)
     return (max_inv + ramp * (min_inv - max_inv)) ** rho
+
+
+def edm_time_to_log_sigma(
+    time: torch.Tensor,
+    sigma_min: float,
+    sigma_max: float,
+) -> torch.Tensor:
+    """Map normalized noise-to-data time ``[0, 1]`` to log-sigma."""
+    if not 0.0 < sigma_min < sigma_max:
+        raise ValueError("Expected 0 < sigma_min < sigma_max")
+    log_max = math.log(sigma_max)
+    return log_max + time * (math.log(sigma_min) - log_max)
+
+
+def edm_log_sigma_to_time(
+    log_sigma: torch.Tensor,
+    sigma_min: float,
+    sigma_max: float,
+) -> torch.Tensor:
+    """Map log-sigma to normalized noise-to-data time ``[0, 1]``."""
+    if not 0.0 < sigma_min < sigma_max:
+        raise ValueError("Expected 0 < sigma_min < sigma_max")
+    log_max = math.log(sigma_max)
+    return (log_max - log_sigma) / (log_max - math.log(sigma_min))
+
+
+def edm_dlog_sigma_dt(sigma_min: float, sigma_max: float) -> float:
+    """Derivative of the linear log-sigma schedule used by EDM AYF."""
+    if not 0.0 < sigma_min < sigma_max:
+        raise ValueError("Expected 0 < sigma_min < sigma_max")
+    return math.log(sigma_min) - math.log(sigma_max)

@@ -6,16 +6,14 @@ AYF-style sampling (return latent tensors, no decoding):
     sample_student_latents_one_step
     sample_student_latents_k_step  – true interval stepping z_{t_i} -> z_{t_{i+1}}
 
-For full-noise-to-data teacher sampling, reuse
-core.rf_scm.sample_teacher_latents and core.rf_scm.sample_noise directly —
-they are unchanged by the AYF generalization.
+Teacher ODE integration is shared with ``core.rf``.
 """
 
 from __future__ import annotations
 
 import torch
 
-from ..rf_scm import RFTeacher, sample_noise
+from ..rf import RFTeacher, sample_uniform_noise
 from .models import RFIntervalFlowMap
 
 
@@ -71,7 +69,7 @@ def sample_student_latents_one_step(
     device: str | torch.device,
 ) -> torch.Tensor:
     """One-step generation: C(z0, 0, 1)."""
-    z0 = sample_noise(n, latent_dim, device)
+    z0 = sample_uniform_noise(n, latent_dim, device)
     t0 = torch.zeros(n, 1, device=device)
     s1 = torch.ones(n, 1, device=device)
     return student(z0, t0, s1)
@@ -96,7 +94,7 @@ def sample_student_latents_k_step(
     schedule: "uniform" | "quadratic" | "sqrt" | explicit list of k+1 times in [0, 1].
     """
     assert k >= 1
-    z = sample_noise(n, latent_dim, device)
+    z = sample_uniform_noise(n, latent_dim, device)
 
     if isinstance(schedule, str):
         base = torch.linspace(0.0, 1.0, k + 1, device=device)

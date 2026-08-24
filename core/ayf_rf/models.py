@@ -1,10 +1,8 @@
 """
 AYF-style interval flow map model.
 
-Generalizes core.rf_scm.RFConsistencyStudent's endpoint-only map
-C(z, t) -> z_1 to an arbitrary-interval map C(z, t, s) -> z_s. The RF
-teacher (core.rf_scm.RFTeacher) is reused unchanged; this module only adds
-the interval-aware student.
+Implements an arbitrary-interval map ``C(z, t, s) -> z_s`` for a trained RF
+velocity field.
 """
 
 from __future__ import annotations
@@ -36,7 +34,8 @@ class RFIntervalFlowMap(nn.Module):
         time_dim = 3 * self.time_embed.dim  # emb(t), emb(s), emb(s - t)
         self.mlp = FiLMMLP(latent_dim, time_dim, latent_dim, hidden=hidden, depth=depth)
 
-    def forward(self, z: torch.Tensor, t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def slope(self, z: torch.Tensor, t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Predict the interval slope ``F_theta(z, t, s)`` used by AYF."""
         if t.ndim == 1:
             t = t[:, None]
         if s.ndim == 1:
@@ -48,5 +47,11 @@ class RFIntervalFlowMap(nn.Module):
         emb_delta = self.time_embed(delta.clamp_min(0.0))
 
         cond = torch.cat([emb_t, emb_s, emb_delta], dim=-1)
-        f = self.mlp(z, cond)
-        return z + delta * f
+        return self.mlp(z, cond)
+
+    def forward(self, z: torch.Tensor, t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t[:, None]
+        if s.ndim == 1:
+            s = s[:, None]
+        return z + (s - t) * self.slope(z, t, s)

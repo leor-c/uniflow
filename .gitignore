@@ -1,8 +1,15 @@
 __pycache__/
 *.pyc
+.venv/
 .idea/
 data/
 *.pt
 runs/
 *.png
+!results/
+!results/*.png
+!results/*.json
 .DS_Store
+build/
+dist/
+*.egg-info/

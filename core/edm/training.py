@@ -1,6 +1,7 @@
 """
 EDM training loops:
     train_edm_teacher
+    train_edm_student_ayf
     train_edm_student_jvp
     train_edm_student_hybrid
 """
@@ -11,8 +12,11 @@ from typing import Callable
 
 import torch
 
-from .models import EDMPrecondDenoiser
+from .models import EDMConsistencyModel, EDMIntervalFlowMap, EDMPrecondDenoiser
 from .losses import (
+    edm_ayf_emd_loss,
+    edm_ayf_interval_eval_loss,
+    edm_ayf_lmd_loss,
     edm_teacher_loss,
     edm_endpoint_distillation_loss,
     edm_jvp_scm_loss,
@@ -46,8 +50,76 @@ def train_edm_teacher(
     denoiser.eval()
 
 
+def train_edm_student_ayf(
+    student: EDMIntervalFlowMap,
+    teacher: EDMPrecondDenoiser,
+    latent_sampler: Callable[[int], torch.Tensor],
+    cfg,
+) -> None:
+    """Train an arbitrary-interval AYF map for an EDM teacher."""
+    student.train()
+    teacher.eval()
+    # The student parameterises normalized time over [edm_student_sigma_min,
+    # sigma_max], not the teacher's [sigma_min, sigma_max]. Below roughly
+    # sigma_data / 10 the PF-ODE is already the identity map, so including that
+    # range would spend a large fraction of t in [0, 1] transporting nothing.
+    student_sigma_min = cfg.edm_student_sigma_min
+    opt = torch.optim.AdamW(student.parameters(), lr=cfg.edm_student_lr)
+    for step in range(1, cfg.edm_student_steps + 1):
+        loss = torch.zeros((), device=cfg.device)
+        loss_emd = None
+        loss_lmd = None
+        if cfg.train_mode in {"emd", "emd+lmd"}:
+            loss_emd = edm_ayf_emd_loss(
+                student, teacher, latent_sampler, cfg.batch_size, cfg.device,
+                sigma_min=student_sigma_min, sigma_max=cfg.sigma_max,
+                time_eps=cfg.edm_time_eps,
+                interval_p_mean=cfg.edm_interval_p_mean,
+                interval_p_std=cfg.edm_interval_p_std,
+                jvp_dt_ref=cfg.edm_jvp_dt_ref,
+            )
+            loss = loss + loss_emd
+        if cfg.train_mode in {"lmd", "emd+lmd"}:
+            loss_lmd = edm_ayf_lmd_loss(
+                student, teacher, latent_sampler, cfg.batch_size, cfg.device,
+                sigma_min=student_sigma_min, sigma_max=cfg.sigma_max,
+                time_eps=cfg.edm_time_eps,
+                interval_p_mean=cfg.edm_interval_p_mean,
+                interval_p_std=cfg.edm_interval_p_std,
+                jvp_dt_ref=cfg.edm_jvp_dt_ref,
+            )
+            weight = cfg.edm_lmd_weight if cfg.train_mode == "emd+lmd" else 1.0
+            loss = loss + weight * loss_lmd
+        if loss_emd is None and loss_lmd is None:
+            raise ValueError(f"Unknown EDM AYF train mode: {cfg.train_mode!r}")
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite EDM AYF loss at step {step}")
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if step % cfg.log_every == 0:
+            interval = edm_ayf_interval_eval_loss(
+                student, teacher, latent_sampler, cfg.batch_size, cfg.device,
+                sigma_min=student_sigma_min, sigma_max=cfg.sigma_max,
+                time_eps=cfg.edm_time_eps,
+                interval_p_mean=cfg.edm_interval_p_mean,
+                interval_p_std=cfg.edm_interval_p_std,
+                ode_steps=cfg.edm_eval_teacher_ode_steps,
+            ).item()
+            msg = (
+                f"[edm ayf] step {step:05d} | loss {loss.item():.6f} | "
+                f"eval interval {interval:.6f}"
+            )
+            if loss_emd is not None:
+                msg += f" | emd {loss_emd.item():.6f}"
+            if loss_lmd is not None:
+                msg += f" | lmd {loss_lmd.item():.6f}"
+            print(msg)
+    student.eval()
+
+
 def train_edm_student_jvp(
-    student: EDMPrecondDenoiser,
+    student: EDMConsistencyModel,
     teacher: EDMPrecondDenoiser,
     latent_sampler: Callable[[int], torch.Tensor],
     cfg,
@@ -85,7 +157,7 @@ def train_edm_student_jvp(
 
 
 def train_edm_student_hybrid(
-    student: EDMPrecondDenoiser,
+    student: EDMConsistencyModel,
     teacher: EDMPrecondDenoiser,
     latent_sampler: Callable[[int], torch.Tensor],
     cfg,

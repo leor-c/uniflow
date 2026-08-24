@@ -1,17 +1,13 @@
 """
-AYF (Align Your Flow) style bounded-latent interval flow maps for RF-sCM.
+AYF-style bounded-latent interval flow maps for rectified flow.
 
-Generalizes the endpoint consistency model C(z, t) -> z_1 (core.rf_scm) to
-an arbitrary-interval flow map C(z, t, s) -> z_s, where t is the source time
-and s is the target time. The endpoint model is the special case s = 1. See
-ayf_bounded_latent_rf_summary.md for the full derivation.
+Learns an arbitrary-interval flow map ``C(z, t, s) -> z_s``, where ``t`` is
+the source time and ``s`` is the target time.
 
-This package builds directly on core.rf_scm: the RF teacher (RFTeacher),
-noise prior (sample_noise), and teacher training loop (train_teacher) are
-reused unchanged — only the interval-aware student, its losses, sampling,
-and training loop are new.
+This package contains the uniform-prior AYF losses and sampling helpers. The
+RF teacher itself is shared through ``core.rf``.
 
-Convention (t=0 → noise, t=1 → data), same as core.rf_scm:
+Convention (t=0 → noise, t=1 → data):
     z0 ~ Uniform([-1,1]^d)
     z1 = encoder(x)
     z_t = (1 - t) * z0 + t * z1

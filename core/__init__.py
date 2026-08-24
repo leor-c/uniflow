@@ -1,6 +1,5 @@
-"""Uniform-noise rectified-flow core: RF-sCM method, its AYF-style interval
-flow map generalization, and the EDM baseline."""
+"""Core models for the RF/AYF prior comparison and EDM baseline."""
 
-from . import modules, autoencoder, rf_scm, ayf_rf, edm
+from . import modules, autoencoder, rf, ayf, ayf_rf, edm
 
-__all__ = ["modules", "autoencoder", "rf_scm", "ayf_rf", "edm"]
+__all__ = ["modules", "autoencoder", "rf", "ayf", "ayf_rf", "edm"]

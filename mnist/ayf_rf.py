@@ -1,10 +1,7 @@
 """
 AYF-style interval flow map experiment on MNIST.
 
-Generalizes mnist/rf_scm.py's endpoint consistency student C(z,t) -> z_1 to
-the arbitrary-interval flow map C(z,t,s) -> z_s from core.ayf_rf. The AE and
-RF teacher pipeline (steps 1-3 below) are unchanged from mnist/rf_scm.py and
-reused directly; see ayf_bounded_latent_rf_summary.md for the derivation.
+Applies the bounded RF + AYF experiment to MNIST latents.
 
 Pipeline:
   1. Train convolutional AE (28×28 → latent_dim-d bounded latent).
@@ -14,8 +11,8 @@ Pipeline:
   5. Sample and visualise generated digits.
 
 Usage:
-    python -m urfm.mnist.ayf_rf
-    python -m urfm.mnist.ayf_rf --latent_dim 128 --teacher_steps 30000
+    python -m mnist.ayf_rf
+    python -m mnist.ayf_rf --latent_dim 128 --teacher_steps 30000
 """
 
 from __future__ import annotations
@@ -30,7 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from core import rf_scm as R
+from core import rf as R
 from core import ayf_rf as A
 from core.autoencoder import freeze
 from mnist.ae import (

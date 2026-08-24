@@ -10,7 +10,7 @@ Decoder uses nearest-neighbour upsample + conv instead of ConvTranspose2d to
 avoid checkerboard artefacts (Odena et al., 2016).
 
 Latent vectors are bounded in (-1, 1)^latent_dim by the encoder tanh, compatible
-with the Uniform[-1,1]^d noise prior used by core.rf_scm.
+with the Uniform[-1,1]^d noise prior used by the bounded RF arm.
 
 Public API
 ----------
@@ -131,7 +131,7 @@ def train_mnist_ae(
     Reconstruction loss: mean squared error on pixels.
 
     Regularisation: mild per-dim second-moment penalty encouraging the latent
-    distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
+distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
     """
     ae.to(device)
     ae.train()

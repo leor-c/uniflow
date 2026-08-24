@@ -1,12 +1,11 @@
 """
 EDM baseline experiment on MNIST.
 
-Same structure as mnist/rf_scm.py but uses Gaussian noise + EDM preconditioning.
-The AE is shared (same architecture; trained independently here).
+Uses Gaussian perturbations and EDM preconditioning with the shared MNIST AE.
 
 Usage:
-    python -m urfm.mnist.edm_baseline
-    python -m urfm.mnist.edm_baseline --latent_dim 128 --teacher_steps 30000
+    python -m mnist.edm_baseline
+    python -m mnist.edm_baseline --latent_dim 128 --teacher_steps 30000
 """
 
 from __future__ import annotations
@@ -58,20 +57,24 @@ class Config:
     # EDM noise
     sigma_data: float = 0.5
     sigma_min: float = 0.002
-    sigma_max: float = 2.0
+    sigma_max: float = 5.0
     edm_rho: float = 7.0
     edm_p_mean: float = -1.2
     edm_p_std: float = 1.2
 
-    # EDM student
+    # EDM AYF student
     edm_student_steps: int = 20000
     edm_student_lr: float = 1e-3
-    edm_jvp_dlog_ref: float = 1.0
-    train_edm_student_mode: str = "jvp"   # "jvp" | "hybrid"
-    edm_endpoint_every: int = 32
-    edm_jvp_weight: float = 1.0
-    edm_anchor_jvp_weight: float = 0.1
-    edm_endpoint_ode_steps: int = 32
+    train_mode: str = "emd"   # "emd" | "lmd" | "emd+lmd"
+    edm_lmd_weight: float = 0.1
+    edm_time_eps: float = 1e-4
+    edm_interval_p_mean: float = -0.6
+    edm_interval_p_std: float = 1.6
+    edm_jvp_dt_ref: float = 1.0
+    # See toy/edm_baseline.py: the student's normalized time must not extend
+    # into the range where the PF-ODE is already the identity map.
+    edm_student_sigma_min: float = 0.05
+    edm_eval_teacher_ode_steps: int = 32
 
     # Sampling
     batch_size: int = 256
@@ -79,7 +82,7 @@ class Config:
     edm_student_sample_k: int = 8
 
     log_every: int = 1000
-    out_dir: str = "runs/mnist_edm"
+    out_dir: str = "runs/mnist_edm_ayf"
 
 
 def fast_cpu_config(**overrides) -> Config:
@@ -142,20 +145,21 @@ def make_plots(ae: MNISTAutoEncoder, teacher, student, cfg: Config, loader):
     save_image_grid(ae.decode(tz), os.path.join(cfg.out_dir, "teacher_samples.png"),
                     title="EDM Teacher (ODE)")
 
-    s1z = E.sample_edm_student_latents_one_step(
+    s1z = E.sample_edm_ayf_latents_one_step(
         student, n, cfg.latent_dim, cfg.device, sigma_max=cfg.sigma_max
     )
     save_image_grid(ae.decode(s1z), os.path.join(cfg.out_dir, "student_1step.png"),
-                    title="EDM Student 1-step")
+                    title="EDM + AYF 1-step")
 
-    skz = E.sample_edm_student_latents_k_step(
+    skz = E.sample_edm_ayf_latents_k_step(
         student, n, cfg.latent_dim, cfg.device,
         k=cfg.edm_student_sample_k,
-        sigma_min=cfg.sigma_min, sigma_max=cfg.sigma_max, rho=cfg.edm_rho,
+        sigma_min=cfg.edm_student_sigma_min, sigma_max=cfg.sigma_max,
+        rho=cfg.edm_rho,
     )
     save_image_grid(ae.decode(skz),
                     os.path.join(cfg.out_dir, f"student_{cfg.edm_student_sample_k}step.png"),
-                    title=f"EDM Student {cfg.edm_student_sample_k}-step")
+                    title=f"EDM + AYF {cfg.edm_student_sample_k}-step")
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +175,12 @@ def main(cfg: Config | None = None):
         ap.add_argument("--ae_steps", type=int, default=None)
         ap.add_argument("--teacher_steps", type=int, default=None)
         ap.add_argument("--student_steps", type=int, default=None)
-        ap.add_argument("--student_mode", default="jvp", choices=["jvp", "hybrid"])
-        ap.add_argument("--out_dir", default="runs/mnist_edm")
+        ap.add_argument(
+            "--student_mode",
+            default="emd",
+            choices=["emd", "lmd", "emd+lmd"],
+        )
+        ap.add_argument("--out_dir", default="runs/mnist_edm_ayf")
         ap.add_argument("--data_root", default="./data")
         args = ap.parse_args()
         cfg = fast_cpu_config() if args.fast else Config()
@@ -184,7 +192,7 @@ def main(cfg: Config | None = None):
             cfg.edm_teacher_steps = args.teacher_steps
         if args.student_steps is not None:
             cfg.edm_student_steps = args.student_steps
-        cfg.train_edm_student_mode = args.student_mode
+        cfg.train_mode = args.student_mode
         cfg.out_dir = args.out_dir
         cfg.data_root = args.data_root
 
@@ -228,17 +236,12 @@ def main(cfg: Config | None = None):
     E.train_edm_teacher(teacher, latent_sampler, cfg)
     torch.save(teacher.state_dict(), os.path.join(cfg.out_dir, "teacher.pt"))
 
-    # --- EDM student ---
-    student = E.EDMPrecondDenoiser(
-        cfg.latent_dim, cfg.hidden, cfg.depth, cfg.sigma_data
+    # --- EDM AYF student ---
+    student = E.EDMIntervalFlowMap(
+        cfg.latent_dim, cfg.hidden, cfg.depth
     ).to(cfg.device)
-    print(f"\nTraining EDM student ({cfg.train_edm_student_mode})...")
-    if cfg.train_edm_student_mode == "jvp":
-        E.train_edm_student_jvp(student, teacher, latent_sampler, cfg)
-    elif cfg.train_edm_student_mode == "hybrid":
-        E.train_edm_student_hybrid(student, teacher, latent_sampler, cfg)
-    else:
-        raise ValueError(f"Unknown mode: {cfg.train_edm_student_mode!r}")
+    print(f"\nTraining EDM + AYF student ({cfg.train_mode})...")
+    E.train_edm_student_ayf(student, teacher, latent_sampler, cfg)
     torch.save(student.state_dict(), os.path.join(cfg.out_dir, "student.pt"))
 
     # --- Visualise ---
