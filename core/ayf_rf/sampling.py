@@ -1,6 +1,6 @@
 """
 AYF-style sampling (return latent tensors, no decoding):
-    sample_time_pair_forward    – source/target time pair 0 <= t < s <= 1
+    sample_ayf_time_pair        – AYF Algorithm 1 interval schedule (shared)
     integrate_teacher_interval  – teacher ODE from t_start to an arbitrary t_end
     integrate_teacher_to_data   – teacher ODE from t_start to t=1
     sample_student_latents_one_step
@@ -17,17 +17,29 @@ from ..rf import RFTeacher, sample_uniform_noise
 from .models import RFIntervalFlowMap
 
 
-def sample_time_pair_forward(
+def sample_ayf_time_pair(
     batch_size: int,
     device: str | torch.device,
     eps: float = 1e-4,
+    p_mean: float = -0.6,
+    p_std: float = 1.6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample 0 <= t < s <= 1 as [B, 1] tensors."""
-    t = eps + (1.0 - 2.0 * eps) * torch.rand(batch_size, 1, device=device)
-    r = torch.rand(batch_size, 1, device=device)
-    s = t + (1.0 - t) * r
-    s = torch.maximum(s, t + eps)
-    return t, s.clamp(max=1.0)
+    """
+    AYF Algorithm 1 interval schedule, shared by every arm in this repo.
+
+    Draw a logistic-normal interval length, then place an interval of that
+    length uniformly along the trajectory:
+
+        d = sigmoid(N(p_mean, p_std^2)),  t ~ U(0, 1 - d),  s = t + d
+
+    Returns ``0 <= t < s <= 1`` as ``[B, 1]`` tensors. This is the single
+    definition used by ``core.ayf``, ``core.ayf_rf`` and ``core.edm`` so that
+    the three arms are trained on the same distribution of intervals.
+    """
+    logits = p_mean + p_std * torch.randn(batch_size, 1, device=device)
+    distance = torch.sigmoid(logits).clamp(eps, 1.0 - eps)
+    t = (1.0 - distance) * torch.rand(batch_size, 1, device=device)
+    return t, t + distance
 
 
 @torch.no_grad()

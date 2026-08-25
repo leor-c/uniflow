@@ -22,7 +22,7 @@ from torch.func import jvp
 
 from ..rf import RFTeacher, sample_uniform_noise
 from .models import RFIntervalFlowMap
-from .sampling import sample_time_pair_forward, integrate_teacher_interval, integrate_teacher_to_data
+from .sampling import sample_ayf_time_pair, integrate_teacher_interval, integrate_teacher_to_data
 
 
 def ayf_emd_loss(
@@ -32,8 +32,10 @@ def ayf_emd_loss(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    jvp_dt_ref: float = 0.02,
+    jvp_dt_ref: float = 1.0,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
     Teacher-based Eulerian/source-time map distillation (EMD):
@@ -46,7 +48,10 @@ def ayf_emd_loss(
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
     z0 = sample_uniform_noise(batch_size, latent_dim, device)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
 
     with torch.no_grad():
@@ -69,8 +74,10 @@ def ayf_emd_ct_loss(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    jvp_dt_ref: float = 0.02,
+    jvp_dt_ref: float = 1.0,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
     Teacher-free AYF-style EMD objective (AYF-CT): uses the sampled pairwise
@@ -82,7 +89,10 @@ def ayf_emd_ct_loss(
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
     z0 = sample_uniform_noise(batch_size, latent_dim, device)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
     v = z1 - z0
 
@@ -104,8 +114,10 @@ def ayf_lmd_loss(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    jvp_dt_ref: float = 0.02,
+    jvp_dt_ref: float = 1.0,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
     Teacher-based target-time/Lagrangian map distillation (LMD):
@@ -118,7 +130,10 @@ def ayf_lmd_loss(
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
     z0 = sample_uniform_noise(batch_size, latent_dim, device)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
 
     z_s_hat, dC_ds = jvp(
@@ -142,6 +157,8 @@ def ayf_pairwise_anchor_loss(
     latent_dim: int,
     device: str | torch.device,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
     Cheap pairwise interval anchor along the sampled RF chord:
@@ -153,7 +170,10 @@ def ayf_pairwise_anchor_loss(
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
     z0 = sample_uniform_noise(batch_size, latent_dim, device)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
     zs = (1.0 - s) * z0 + s * z1
     pred = student(zt, t, s)
@@ -168,6 +188,8 @@ def ayf_teacher_interval_anchor_loss(
     latent_dim: int,
     device: str | torch.device,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
     ode_steps: int = 16,
 ) -> torch.Tensor:
     """
@@ -179,7 +201,10 @@ def ayf_teacher_interval_anchor_loss(
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
     z0 = sample_uniform_noise(batch_size, latent_dim, device)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
 
     with torch.no_grad():
@@ -219,12 +244,17 @@ def ayf_interval_eval_loss(
     latent_dim: int,
     device: str | torch.device,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
     ode_steps: int = 32,
 ) -> torch.Tensor:
     """Eval-only: C(z_t,t,s) vs teacher ODE target Phi(t -> s)(z_t)."""
     z1 = latent_sampler(batch_size)
     z0 = sample_uniform_noise(batch_size, latent_dim, device)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
     target = integrate_teacher_interval(teacher, zt, t, s, steps=ode_steps)
     pred = student(zt, t, s)

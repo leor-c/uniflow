@@ -21,7 +21,7 @@ from torch.func import jvp
 
 from ..rf.models import RFTeacher
 from ..ayf_rf.models import RFIntervalFlowMap
-from ..ayf_rf.sampling import sample_time_pair_forward
+from ..ayf_rf.sampling import sample_ayf_time_pair
 from ..ayf_rf.sampling import integrate_teacher_interval, integrate_teacher_to_data
 from .sampling import sample_noise
 
@@ -36,6 +36,8 @@ def ayf_emd_loss(
     sigma_data: float = 0.5,
     jvp_dt_ref: float = 1.0,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
     AYF EMD loss with Gaussian noise z0 ~ N(0, sigma_data² I).
@@ -45,7 +47,10 @@ def ayf_emd_loss(
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
     z0 = sample_noise(batch_size, latent_dim, device, sigma_data)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
 
     with torch.no_grad():
@@ -72,6 +77,8 @@ def ayf_lmd_loss(
     sigma_data: float = 0.5,
     jvp_dt_ref: float = 1.0,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
     AYF LMD loss with Gaussian noise.
@@ -81,7 +88,10 @@ def ayf_lmd_loss(
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
     z0 = sample_noise(batch_size, latent_dim, device, sigma_data)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
 
     z_s_hat, dC_ds = jvp(
@@ -131,12 +141,17 @@ def ayf_interval_eval_loss(
     device: str | torch.device,
     sigma_data: float = 0.5,
     time_eps: float = 1e-4,
+    interval_p_mean: float = -0.6,
+    interval_p_std: float = 1.6,
     ode_steps: int = 32,
 ) -> torch.Tensor:
     """Eval-only: C(z_t, t, s) vs teacher ODE interval target."""
     z1 = latent_sampler(batch_size)
     z0 = sample_noise(batch_size, latent_dim, device, sigma_data)
-    t, s = sample_time_pair_forward(batch_size, device, eps=time_eps)
+    t, s = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
+    )
     zt = (1.0 - t) * z0 + t * z1
     target = integrate_teacher_interval(teacher, zt, t, s, steps=ode_steps)
     pred = student(zt, t, s)

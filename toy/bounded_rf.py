@@ -63,6 +63,9 @@ class Config:
 
     jvp_dt_ref: float = 1.0
     time_eps: float = 1e-4
+    # Shared AYF Algorithm 1 interval schedule (same values in every arm).
+    interval_p_mean: float = -0.6
+    interval_p_std: float = 1.6
 
     interval_teacher_ode_steps: int = 16
     eval_teacher_ode_steps: int = 32

@@ -73,6 +73,8 @@ def train_student_ayf(
             cfg.batch_size, cfg.latent_dim, cfg.device,
             sigma_data=cfg.sigma_data,
             jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
+            interval_p_mean=cfg.interval_p_mean,
+            interval_p_std=cfg.interval_p_std,
         )
         loss = cfg.emd_weight * loss_emd
 
@@ -83,6 +85,8 @@ def train_student_ayf(
                 cfg.batch_size, cfg.latent_dim, cfg.device,
                 sigma_data=cfg.sigma_data,
                 jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std,
             )
             loss = loss + cfg.lmd_weight * loss_lmd
 
@@ -104,7 +108,9 @@ def train_student_ayf(
                 student, teacher, latent_sampler,
                 cfg.batch_size, cfg.latent_dim, cfg.device,
                 sigma_data=cfg.sigma_data,
-                time_eps=cfg.time_eps, ode_steps=cfg.eval_teacher_ode_steps,
+                time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std, ode_steps=cfg.eval_teacher_ode_steps,
             ).item()
 
             msg = (

@@ -229,10 +229,10 @@ class EDMTests(unittest.TestCase):
         time_eps = 1e-4
 
         with patch(
-            "core.edm.losses.torch.randn",
+            "core.ayf_rf.sampling.torch.randn",
             return_value=torch.zeros(5, 1),
         ), patch(
-            "core.edm.losses.torch.rand",
+            "core.ayf_rf.sampling.torch.rand",
             return_value=source_fraction,
         ), patch(
             "core.edm.losses.torch.randn_like",
@@ -274,6 +274,7 @@ class EDMTests(unittest.TestCase):
                     sigma_min=0.01,
                     sigma_max=12.0,
                     rho=7.0,
+                    schedule="karras",
                 )
 
         sigmas = edm_karras_sigmas(5, 0.01, 12.0, 7.0, "cpu")

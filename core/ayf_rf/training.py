@@ -41,7 +41,8 @@ def train_student_interval(
     cfg fields used: batch_size, latent_dim, device, student_lr, student_steps,
                      train_mode ("emd" | "ct"), emd_weight, lmd_weight,
                      pairwise_anchor_weight, teacher_interval_anchor_weight,
-                     jvp_dt_ref, time_eps, interval_teacher_ode_steps,
+                     jvp_dt_ref, time_eps, interval_p_mean, interval_p_std,
+                     interval_teacher_ode_steps,
                      eval_teacher_ode_steps, log_every.
     """
     student.train()
@@ -53,11 +54,15 @@ def train_student_interval(
             loss_emd = ayf_emd_loss(
                 student, teacher, latent_sampler, cfg.batch_size, cfg.latent_dim, cfg.device,
                 jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std,
             )
         elif cfg.train_mode == "ct":
             loss_emd = ayf_emd_ct_loss(
                 student, latent_sampler, cfg.batch_size, cfg.latent_dim, cfg.device,
                 jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std,
             )
         else:
             raise ValueError(f"Unknown train_mode: {cfg.train_mode!r}")
@@ -72,6 +77,8 @@ def train_student_interval(
             loss_lmd = ayf_lmd_loss(
                 student, teacher, latent_sampler, cfg.batch_size, cfg.latent_dim, cfg.device,
                 jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std,
             )
             loss = loss + cfg.lmd_weight * loss_lmd
 
@@ -79,13 +86,18 @@ def train_student_interval(
             loss_pair = ayf_pairwise_anchor_loss(
                 student, latent_sampler, cfg.batch_size, cfg.latent_dim, cfg.device,
                 time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std,
             )
             loss = loss + cfg.pairwise_anchor_weight * loss_pair
 
         if cfg.teacher_interval_anchor_weight > 0.0:
             loss_teacher_anchor = ayf_teacher_interval_anchor_loss(
                 student, teacher, latent_sampler, cfg.batch_size, cfg.latent_dim, cfg.device,
-                time_eps=cfg.time_eps, ode_steps=cfg.interval_teacher_ode_steps,
+                time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std,
+                ode_steps=cfg.interval_teacher_ode_steps,
             )
             loss = loss + cfg.teacher_interval_anchor_weight * loss_teacher_anchor
 
@@ -103,7 +115,9 @@ def train_student_interval(
             ).item()
             itv = ayf_interval_eval_loss(
                 student, teacher, latent_sampler, cfg.batch_size, cfg.latent_dim, cfg.device,
-                time_eps=cfg.time_eps, ode_steps=cfg.eval_teacher_ode_steps,
+                time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std, ode_steps=cfg.eval_teacher_ode_steps,
             ).item()
 
             msg = (

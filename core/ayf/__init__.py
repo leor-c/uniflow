@@ -17,7 +17,7 @@ Models (from core.ayf_rf):
 
 Sampling (sampling.py):
     sample_noise                    – z0 ~ N(0, sigma_data² I)
-    sample_time_pair_forward        – re-exported from core.ayf_rf
+    sample_ayf_time_pair        – re-exported from core.ayf_rf
     integrate_teacher_interval      – re-exported from core.ayf_rf
     integrate_teacher_to_data       – re-exported from core.ayf_rf
     sample_teacher_latents
@@ -38,7 +38,7 @@ Training (training.py):
 from ..ayf_rf.models import RFIntervalFlowMap
 from .sampling import (
     sample_noise,
-    sample_time_pair_forward,
+    sample_ayf_time_pair,
     integrate_teacher_interval,
     integrate_teacher_to_data,
     sample_teacher_latents,
@@ -56,7 +56,7 @@ from .training import train_teacher_gaussian, train_student_ayf
 __all__ = [
     "RFIntervalFlowMap",
     "sample_noise",
-    "sample_time_pair_forward",
+    "sample_ayf_time_pair",
     "integrate_teacher_interval",
     "integrate_teacher_to_data",
     "sample_teacher_latents",

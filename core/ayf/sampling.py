@@ -5,7 +5,7 @@ Identical to core.ayf_rf.sampling except the noise prior:
     z0 ~ N(0, sigma_data² I)   instead of Uniform[-1, 1]^d
 
     sample_noise                    – z0 ~ N(0, sigma_data² I)
-    sample_time_pair_forward        – re-exported from core.ayf_rf (unchanged)
+    sample_ayf_time_pair        – re-exported from core.ayf_rf (unchanged)
     integrate_teacher_interval      – re-exported from core.ayf_rf (unchanged)
     integrate_teacher_to_data       – re-exported from core.ayf_rf (unchanged)
     sample_teacher_latents          – full ODE from Gaussian z0
@@ -20,7 +20,7 @@ import torch
 from ..rf.models import RFTeacher
 from ..ayf_rf.models import RFIntervalFlowMap
 from ..ayf_rf.sampling import (
-    sample_time_pair_forward,
+    sample_ayf_time_pair,
     integrate_teacher_interval,
     integrate_teacher_to_data,
 )

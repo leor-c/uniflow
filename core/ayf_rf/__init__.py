@@ -31,7 +31,7 @@ Training (training.py):
     train_student_interval
 
 Sampling (sampling.py; return latent tensors, no decoding):
-    sample_time_pair_forward    – source/target time pair 0 <= t < s <= 1
+    sample_ayf_time_pair    – source/target time pair 0 <= t < s <= 1
     integrate_teacher_interval  – teacher ODE from t_start to arbitrary t_end
     integrate_teacher_to_data   – teacher ODE from t_start to t=1
     sample_student_latents_one_step
@@ -40,7 +40,7 @@ Sampling (sampling.py; return latent tensors, no decoding):
 
 from .models import RFIntervalFlowMap
 from .sampling import (
-    sample_time_pair_forward,
+    sample_ayf_time_pair,
     integrate_teacher_interval,
     integrate_teacher_to_data,
     sample_student_latents_one_step,
@@ -59,7 +59,7 @@ from .training import train_student_interval
 
 __all__ = [
     "RFIntervalFlowMap",
-    "sample_time_pair_forward",
+    "sample_ayf_time_pair",
     "integrate_teacher_interval",
     "integrate_teacher_to_data",
     "sample_student_latents_one_step",

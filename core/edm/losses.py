@@ -23,6 +23,7 @@ from .sampling import (
     integrate_edm_teacher,
     integrate_edm_teacher_interval,
 )
+from ..ayf_rf.sampling import sample_ayf_time_pair
 from .utils import edm_sample_log_sigma, edm_time_to_log_sigma
 
 
@@ -61,15 +62,13 @@ def _sample_edm_ayf_state(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         z_clean = latent_sampler(batch_size)
-    # AYF Algorithm 1: sample a logistic-normal interval distance, then place
-    # an interval of that length uniformly on the trajectory. Our normalized
-    # EDM time runs noise -> data, opposite to the paper's convention.
-    interval_logits = interval_p_mean + interval_p_std * torch.randn(
-        batch_size, 1, device=device
+    # Shared AYF Algorithm 1 interval schedule, so the EDM student is trained
+    # on the same distribution of (t, s) as the two RF arms. Our normalized EDM
+    # time runs noise -> data, opposite to the paper's convention.
+    time, target_time = sample_ayf_time_pair(
+        batch_size, device, eps=time_eps,
+        p_mean=interval_p_mean, p_std=interval_p_std,
     )
-    distance = torch.sigmoid(interval_logits).clamp(time_eps, 1.0 - time_eps)
-    time = (1.0 - distance) * torch.rand(batch_size, 1, device=device)
-    target_time = time + distance
     log_sigma = edm_time_to_log_sigma(time, sigma_min, sigma_max)
     z_noisy = z_clean + log_sigma.exp() * torch.randn_like(z_clean)
     return z_noisy, time, target_time

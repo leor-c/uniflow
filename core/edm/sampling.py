@@ -187,13 +187,26 @@ def sample_edm_ayf_latents_k_step(
     sigma_min: float = 0.002,
     sigma_max: float = 2.0,
     rho: float = 7.0,
+    schedule: str = "uniform",
 ) -> torch.Tensor:
-    """Compose ``k`` deterministic AYF intervals on a Karras schedule."""
+    """
+    Compose ``k`` deterministic AYF intervals.
+
+    schedule: ``"uniform"`` spaces the nodes evenly in normalized time, which
+    is what the RF arms' ``sample_student_latents_k_step`` does, so k-step
+    numbers are comparable across arms. ``"karras"`` uses the EDM-native
+    rho-schedule in sigma instead.
+    """
     if k < 1:
         raise ValueError("k must be at least 1")
-    sigmas = edm_karras_sigmas(k + 1, sigma_min, sigma_max, rho, device)
-    times = edm_log_sigma_to_time(sigmas.log(), sigma_min, sigma_max)
-    z = sigmas[0] * torch.randn(n, latent_dim, device=device)
+    if schedule == "uniform":
+        times = torch.linspace(0.0, 1.0, k + 1, device=device)
+    elif schedule == "karras":
+        sigmas = edm_karras_sigmas(k + 1, sigma_min, sigma_max, rho, device)
+        times = edm_log_sigma_to_time(sigmas.log(), sigma_min, sigma_max)
+    else:
+        raise ValueError(f"Unknown schedule: {schedule!r}")
+    z = sigma_max * torch.randn(n, latent_dim, device=device)
     for i in range(k):
         time_start = torch.full((n, 1), times[i].item(), device=device)
         time_end = torch.full((n, 1), times[i + 1].item(), device=device)
