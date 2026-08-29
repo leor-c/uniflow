@@ -1,13 +1,13 @@
 """
 AYF training loops.
 
-    train_teacher_gaussian  – RF teacher with z0 ~ N(0, sigma_data² I)
+    train_teacher_gaussian  – RF teacher with z0 ~ N(0, base_std² I)
     train_student_ayf       – AYF interval student with Gaussian noise
 
 cfg fields for teacher:  batch_size, latent_dim, device, teacher_lr,
-                         teacher_steps, sigma_data, log_every.
+                         teacher_steps, base_std, log_every.
 cfg fields for student:  batch_size, latent_dim, device, student_lr,
-                         student_steps, sigma_data, emd_weight, lmd_weight,
+                         student_steps, base_std, emd_weight, lmd_weight,
                          jvp_dt_ref, time_eps, eval_teacher_ode_steps, log_every.
 """
 
@@ -34,14 +34,14 @@ def train_teacher_gaussian(
     latent_sampler: Callable[[int], torch.Tensor],
     cfg,
 ) -> None:
-    """Train the RF teacher with Gaussian noise z0 ~ N(0, sigma_data² I)."""
+    """Train the RF teacher with Gaussian noise ``z0 ~ N(0, base_std² I)``."""
     teacher.train()
     opt = torch.optim.AdamW(teacher.parameters(), lr=cfg.teacher_lr)
 
     for step in range(1, cfg.teacher_steps + 1):
         with torch.no_grad():
             z1 = latent_sampler(cfg.batch_size)
-        z0 = sample_noise(cfg.batch_size, cfg.latent_dim, cfg.device, cfg.sigma_data)
+        z0 = sample_noise(cfg.batch_size, cfg.latent_dim, cfg.device, cfg.base_std)
         t = torch.rand(cfg.batch_size, 1, device=cfg.device)
         zt = (1.0 - t) * z0 + t * z1
         pred_v = teacher(zt, t)
@@ -71,7 +71,7 @@ def train_student_ayf(
         loss_emd = ayf_emd_loss(
             student, teacher, latent_sampler,
             cfg.batch_size, cfg.latent_dim, cfg.device,
-            sigma_data=cfg.sigma_data,
+            base_std=cfg.base_std,
             jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
             interval_p_mean=cfg.interval_p_mean,
             interval_p_std=cfg.interval_p_std,
@@ -83,7 +83,7 @@ def train_student_ayf(
             loss_lmd = ayf_lmd_loss(
                 student, teacher, latent_sampler,
                 cfg.batch_size, cfg.latent_dim, cfg.device,
-                sigma_data=cfg.sigma_data,
+                base_std=cfg.base_std,
                 jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
                 interval_p_mean=cfg.interval_p_mean,
                 interval_p_std=cfg.interval_p_std,
@@ -101,13 +101,13 @@ def train_student_ayf(
             ep = ayf_endpoint_eval_loss(
                 student, teacher, latent_sampler,
                 cfg.batch_size, cfg.latent_dim, cfg.device,
-                sigma_data=cfg.sigma_data,
+                base_std=cfg.base_std,
                 time_eps=cfg.time_eps, ode_steps=cfg.eval_teacher_ode_steps,
             ).item()
             itv = ayf_interval_eval_loss(
                 student, teacher, latent_sampler,
                 cfg.batch_size, cfg.latent_dim, cfg.device,
-                sigma_data=cfg.sigma_data,
+                base_std=cfg.base_std,
                 time_eps=cfg.time_eps,
                 interval_p_mean=cfg.interval_p_mean,
                 interval_p_std=cfg.interval_p_std, ode_steps=cfg.eval_teacher_ode_steps,

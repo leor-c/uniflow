@@ -1,11 +1,11 @@
 """
-Run the three release benchmark arms: bounded RF + AYF, Gaussian RF + AYF,
+Run the three release benchmark arms: Uniform RF + AYF, Gaussian RF + AYF,
 and EDM + AYF.
 
 Each experiment uses its own default Config. The --dataset, --seed/--seeds,
---ae_steps, --student_steps, and --teacher_steps flags are applied on top
-of those defaults only when explicitly passed; any flag left unset keeps
-each experiment's own default for that field.
+--latent_dim, --ae_steps, --student_steps, and --teacher_steps flags are
+applied on top of those defaults only when explicitly passed; any flag left
+unset keeps each experiment's own default for that field.
 
 Usage:
     python -m toy.run_all
@@ -26,15 +26,42 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 
-from toy import bounded_rf, edm_baseline, gaussian_rf
-from toy.common import save_metrics
+from toy import edm_baseline, gaussian_rf, uniform_rf
+from toy.common import (
+    BENCHMARK_PROTOCOL,
+    DENSITY_PROTOCOL,
+    DENSITY_SAMPLES,
+    TARGET_NOISE_SCALES,
+    save_metrics,
+)
 
 
-PIPELINES = ("bounded_rf", "gaussian_rf", "edm_ayf")
+PIPELINES = ("uniform_rf", "gaussian_rf", "edm_ayf")
 PIPELINE_LABELS = {
-    "bounded_rf": "Bounded RF + AYF",
+    "uniform_rf": "Uniform RF + AYF",
     "gaussian_rf": "Gaussian RF + AYF",
     "edm_ayf": "EDM + AYF",
+}
+OUTPUT_PREFIXES = (
+    "ae_reconstruction",
+    "teacher",
+    "student_1_step",
+    "student_8_step",
+)
+METRIC_SUFFIXES = (
+    "target_nll",
+    "coverage_nll",
+    "off_support_rate",
+)
+METRIC_LABELS = {
+    "target_nll": "Fidelity: target NLL ↓",
+    "coverage_nll": "Coverage: KDE NLL ↓",
+    "off_support_rate": "Off support (>3σ) ↓",
+}
+REQUIRED_METRIC_KEYS = {
+    f"{output}_{metric}"
+    for output in OUTPUT_PREFIXES
+    for metric in METRIC_SUFFIXES
 }
 
 
@@ -42,6 +69,8 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
     if args.dataset is not None:
         cfg.dataset = args.dataset
     cfg.seed = seed
+    if args.latent_dim is not None:
+        cfg.latent_dim = args.latent_dim
     if args.ae_steps is not None:
         cfg.ae_steps = args.ae_steps
     if args.teacher_steps is not None:
@@ -66,6 +95,15 @@ def _configure_multi_seed_outputs(cfg, pipeline: str, seed: int, args) -> None:
         cfg.out = str(Path("results") / f"{pipeline}_{{}}-seed-{seed}.png")
 
 
+def _has_current_metric_schema(metrics: dict) -> bool:
+    return all(
+        REQUIRED_METRIC_KEYS.issubset(pipeline_metrics)
+        and pipeline_metrics.get("benchmark_protocol") == BENCHMARK_PROTOCOL
+        and pipeline_metrics.get("evaluation_protocol") == DENSITY_PROTOCOL
+        for pipeline_metrics in metrics.values()
+    )
+
+
 def _load_seed_metrics(dataset: str, seed: int):
     paths = {
         pipeline: _seed_metrics_path(pipeline, dataset, seed)
@@ -73,24 +111,27 @@ def _load_seed_metrics(dataset: str, seed: int):
     }
     if not all(path.is_file() for path in paths.values()):
         return None
-    return {
+    metrics = {
         pipeline: json.loads(path.read_text())
         for pipeline, path in paths.items()
     }
+    if not _has_current_metric_schema(metrics):
+        return None
+    return metrics
 
 
 def _run_seed(args, seed: int, *, multi_seed: bool):
     dataset = args.dataset or "8gaussians"
     print("\n" + "=" * 60)
-    print(f"Running seed {seed}: toy.bounded_rf")
+    print(f"Running seed {seed}: toy.uniform_rf")
     print("=" * 60)
     cfg = _apply_overrides(
-        bounded_rf.Config(), args, seed,
+        uniform_rf.Config(), args, seed,
         teacher_field="teacher_steps", student_field="student_steps",
     )
     if multi_seed or args.plot_all_seeds:
-        _configure_multi_seed_outputs(cfg, "bounded_rf", seed, args)
-    bounded_metrics = bounded_rf.main(cfg)
+        _configure_multi_seed_outputs(cfg, "uniform_rf", seed, args)
+    uniform_metrics = uniform_rf.main(cfg)
 
     print("\n" + "=" * 60)
     print(f"Running seed {seed}: toy.gaussian_rf")
@@ -108,14 +149,14 @@ def _run_seed(args, seed: int, *, multi_seed: bool):
     print("=" * 60)
     cfg = _apply_overrides(
         edm_baseline.Config(), args, seed,
-        teacher_field="edm_teacher_steps", student_field="edm_student_steps",
+        teacher_field="edm_teacher_steps", student_field="student_steps",
     )
     if multi_seed or args.plot_all_seeds:
         _configure_multi_seed_outputs(cfg, "edm_ayf", seed, args)
     edm_metrics = edm_baseline.main(cfg)
 
     return {
-        "bounded_rf": bounded_metrics,
+        "uniform_rf": uniform_metrics,
         "gaussian_rf": gaussian_metrics,
         "edm_ayf": edm_metrics,
     }
@@ -125,7 +166,11 @@ def _aggregate(all_metrics: dict[int, dict]) -> dict:
     seeds = sorted(all_metrics)
     aggregate = {}
     for pipeline in PIPELINES:
-        metric_names = sorted(all_metrics[seeds[0]][pipeline])
+        metric_names = sorted(
+            key
+            for key in all_metrics[seeds[0]][pipeline]
+            if key in REQUIRED_METRIC_KEYS
+        )
         aggregate[pipeline] = {}
         for metric_name in metric_names:
             values = [all_metrics[seed][pipeline][metric_name] for seed in seeds]
@@ -137,36 +182,51 @@ def _aggregate(all_metrics: dict[int, dict]) -> dict:
     return {
         "num_seeds": len(seeds),
         "seeds": seeds,
+        "metric": "two-sided density fidelity and coverage",
+        "metric_samples": DENSITY_SAMPLES,
+        "metric_sampling": "uniform without replacement",
+        "target_density": "known analytic mixture (arc mixture by midpoint quadrature)",
+        "coverage_density": "generated-sample isotropic Gaussian KDE",
+        "target_noise_scales": TARGET_NOISE_SCALES,
+        "off_support_threshold": "three target noise scales",
+        "benchmark_protocol": BENCHMARK_PROTOCOL,
+        "evaluation_protocol": DENSITY_PROTOCOL,
         "std_definition": "sample standard deviation (n - 1 denominator)",
         "pipelines": aggregate,
     }
 
 
-def _report_metric_keys(summary: dict) -> list[str]:
+def _report_output_prefixes(summary: dict) -> list[str]:
     available = summary["pipelines"][PIPELINES[0]]
-    student_keys = sorted(
-        (key for key in available if key.startswith("student_") and key.endswith("_step_swd")),
-        key=lambda key: int(key.split("_")[1]),
+    student_prefixes = sorted(
+        {
+            key.removesuffix(f"_{metric}")
+            for key in available
+            for metric in METRIC_SUFFIXES
+            if key.startswith("student_") and key.endswith(f"_{metric}")
+        },
+        key=lambda prefix: int(prefix.split("_")[1]),
     )
-    return ["teacher_swd", *student_keys]
+    return ["teacher", *student_prefixes]
 
 
-def _metric_label(metric_key: str) -> str:
-    if metric_key == "teacher_swd":
+def _output_label(output_prefix: str) -> str:
+    if output_prefix == "teacher":
         return "Teacher"
-    steps = metric_key.split("_")[1]
+    if output_prefix == "ae_reconstruction":
+        return "AE reconstruction"
+    steps = output_prefix.split("_")[1]
     return f"Student, {steps} step{'s' if steps != '1' else ''}"
 
 
-def _observation_metric_label(metric_key: str) -> str:
-    if metric_key == "teacher_swd":
-        return "teacher"
-    steps = metric_key.split("_")[1]
-    return f"{steps}-step student"
+def _format_metric(metric: dict, suffix: str) -> str:
+    if suffix == "off_support_rate":
+        return f"{100.0 * metric['mean']:.1f}% ± {100.0 * metric['std']:.1f}%"
+    return f"{metric['mean']:.3f} ± {metric['std']:.3f}"
 
 
 def _render_markdown_summary(summary: dict, dataset: str) -> str:
-    metric_keys = _report_metric_keys(summary)
+    output_prefixes = _report_output_prefixes(summary)
     seeds = ", ".join(str(seed) for seed in summary["seeds"])
     dataset_title = dataset.replace("8gaussians", "8-Gaussians").replace("_", " ")
 
@@ -174,16 +234,56 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
         f"# {dataset_title} benchmark results",
         "",
         f"Aggregated over **{summary['num_seeds']} seeds** ({seeds}). Values are mean ± sample",
-        "standard deviation of sliced Wasserstein distance (SWD); lower is better.",
+        f"standard deviation on {DENSITY_SAMPLES:,} uniformly sampled points. Fidelity is",
+        "generated-sample NLL under the known target density; coverage is held-out target",
+        "NLL under a generated-sample KDE. Off-support is the fraction farther than three",
+        f"target noise scales ({3.0 * TARGET_NOISE_SCALES[dataset]:g}) from clean support.",
+        "All metrics are lower-is-better and should be interpreted together.",
         "",
-        "| Pipeline | " + " | ".join(_metric_label(key) for key in metric_keys) + " |",
-        "|---|" + "---:|" * len(metric_keys),
     ]
+
+    for output_prefix in output_prefixes:
+        lines.extend(
+            [
+                f"## {_output_label(output_prefix)}",
+                "",
+                "| Pipeline | "
+                + " | ".join(METRIC_LABELS[suffix] for suffix in METRIC_SUFFIXES)
+                + " |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for pipeline in PIPELINES:
+            cells = [
+                _format_metric(
+                    summary["pipelines"][pipeline][f"{output_prefix}_{suffix}"],
+                    suffix,
+                )
+                for suffix in METRIC_SUFFIXES
+            ]
+            lines.append(f"| {PIPELINE_LABELS[pipeline]} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## AE reconstruction reference",
+            "",
+            "The AE row provides a near-data calibration point for finite-sample and density-estimation effects.",
+            "",
+            "| Pipeline | "
+            + " | ".join(METRIC_LABELS[suffix] for suffix in METRIC_SUFFIXES)
+            + " |",
+            "|---|---:|---:|---:|",
+        ]
+    )
     for pipeline in PIPELINES:
-        cells = []
-        for metric_key in metric_keys:
-            metric = summary["pipelines"][pipeline][metric_key]
-            cells.append(f"{metric['mean']:.3f} ± {metric['std']:.3f}")
+        cells = [
+            _format_metric(
+                summary["pipelines"][pipeline][f"ae_reconstruction_{suffix}"],
+                suffix,
+            )
+            for suffix in METRIC_SUFFIXES
+        ]
         lines.append(f"| {PIPELINE_LABELS[pipeline]} | " + " | ".join(cells) + " |")
 
     lines.extend(
@@ -191,7 +291,7 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
             "",
             "## Aggregate comparison",
             "",
-            f"![Aggregate SWD comparison](summary_{dataset}.png)",
+            f"![Aggregate target-NLL comparison](summary_{dataset}.png)",
             "",
             "Bars show means, error bars show ± one sample standard deviation, and points show individual seeds.",
             "",
@@ -199,30 +299,18 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
             "",
         ]
     )
-    for metric_key in metric_keys:
-        best_pipeline = min(
-            PIPELINES,
-            key=lambda pipeline: summary["pipelines"][pipeline][metric_key]["mean"],
-        )
-        best = summary["pipelines"][best_pipeline][metric_key]["mean"]
-        lines.append(
-            f"- Lowest observed mean {_observation_metric_label(metric_key)} SWD: "
-            f"{PIPELINE_LABELS[best_pipeline]} ({best:.3f})."
-        )
-
-    one_step_key = "student_1_step_swd"
-    later_steps = [key for key in metric_keys if key.startswith("student_") and key != one_step_key]
-    if one_step_key in metric_keys and later_steps:
-        final_key = later_steps[-1]
-        final_steps = final_key.split("_")[1]
-        for pipeline in PIPELINES:
-            one_step = summary["pipelines"][pipeline][one_step_key]["mean"]
-            final_step = summary["pipelines"][pipeline][final_key]["mean"]
-            direction = "improves" if final_step < one_step else "worsens"
-            lines.append(
-                f"- For {PIPELINE_LABELS[pipeline]}, {final_steps}-step sampling {direction} "
-                f"the mean from {one_step:.3f} to {final_step:.3f}."
+    for output_prefix in output_prefixes:
+        winners = []
+        for suffix in METRIC_SUFFIXES:
+            metric_key = f"{output_prefix}_{suffix}"
+            best_pipeline = min(
+                PIPELINES,
+                key=lambda pipeline: summary["pipelines"][pipeline][metric_key]["mean"],
             )
+            winners.append(
+                f"{METRIC_LABELS[suffix].replace(' ↓', '')}: {PIPELINE_LABELS[best_pipeline]}"
+            )
+        lines.append(f"- {_output_label(output_prefix)} — " + "; ".join(winners) + ".")
 
     lines.extend(
         [
@@ -245,11 +333,12 @@ def _save_markdown_summary(summary: dict, dataset: str) -> Path:
 
 
 def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
-    metric_keys = _report_metric_keys(summary)
-    group_positions = list(range(len(metric_keys)))
+    output_prefixes = _report_output_prefixes(summary)
+    group_positions = list(range(len(output_prefixes)))
     width = 0.24
+    metric_suffix = "target_nll"
     colors = {
-        "bounded_rf": "#4C78A8",
+        "uniform_rf": "#4C78A8",
         "gaussian_rf": "#F58518",
         "edm_ayf": "#54A24B",
     }
@@ -258,13 +347,14 @@ def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
     for pipeline_index, pipeline in enumerate(PIPELINES):
         offset = (pipeline_index - (len(PIPELINES) - 1) / 2) * width
         positions = [position + offset for position in group_positions]
+        metric_keys = [f"{output}_{metric_suffix}" for output in output_prefixes]
         means = [
-            summary["pipelines"][pipeline][metric_key]["mean"]
-            for metric_key in metric_keys
+            summary["pipelines"][pipeline][key]["mean"]
+            for key in metric_keys
         ]
         stds = [
-            summary["pipelines"][pipeline][metric_key]["std"]
-            for metric_key in metric_keys
+            summary["pipelines"][pipeline][key]["std"]
+            for key in metric_keys
         ]
         ax.bar(
             positions,
@@ -278,19 +368,17 @@ def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
             label=PIPELINE_LABELS[pipeline],
             zorder=2,
         )
-
-        for metric_position, metric_key in zip(positions, metric_keys):
-            values = list(summary["pipelines"][pipeline][metric_key]["values"].values())
-            if len(values) == 1:
-                jitters = [0.0]
-            else:
-                spread = width * 0.42
-                jitters = [
-                    -spread / 2 + spread * index / (len(values) - 1)
-                    for index in range(len(values))
-                ]
+        for position, metric_key in zip(positions, metric_keys):
+            values = list(
+                summary["pipelines"][pipeline][metric_key]["values"].values()
+            )
+            spread = width * 0.42
+            jitters = [0.0] if len(values) == 1 else [
+                -spread / 2 + spread * index / (len(values) - 1)
+                for index in range(len(values))
+            ]
             ax.scatter(
-                [metric_position + jitter for jitter in jitters],
+                [position + jitter for jitter in jitters],
                 values,
                 s=16,
                 color="#202020",
@@ -301,14 +389,13 @@ def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
 
     dataset_title = dataset.replace("8gaussians", "8-Gaussians").replace("_", " ")
     ax.set_title(
-        f"{dataset_title}: aggregate SWD across {summary['num_seeds']} seeds\n"
+        f"{dataset_title}: target NLL across {summary['num_seeds']} seeds\n"
         "bars = mean, error bars = sample standard deviation, points = seeds"
     )
-    ax.set_ylabel("Sliced Wasserstein distance (lower is better)")
-    ax.set_xticks(group_positions, [_metric_label(key) for key in metric_keys])
-    ax.set_ylim(bottom=0)
+    ax.set_ylabel("Generated-sample NLL under target density (lower is better)")
+    ax.set_xticks(group_positions, [_output_label(key) for key in output_prefixes])
     ax.grid(axis="y", alpha=0.25, linewidth=0.8, zorder=0)
-    ax.legend(frameon=False, loc="upper left")
+    ax.legend(frameon=False, loc="best")
     fig.tight_layout()
 
     path = Path("results") / f"summary_{dataset}.png"
@@ -346,9 +433,11 @@ def main():
                     help="Reuse complete per-seed metric files when available.")
     ap.add_argument("--workers", type=int, default=None,
                     help="Concurrent seed processes on CUDA (default: all seeds).")
-    ap.add_argument("--ae_steps", type=int, default=None)
-    ap.add_argument("--teacher_steps", type=int, default=None)
-    ap.add_argument("--student_steps", type=int, default=None)
+    ap.add_argument("--latent-dim", type=int, default=None,
+                    help="Shared autoencoder latent dimension for all pipelines.")
+    ap.add_argument("--ae-steps", type=int, default=None)
+    ap.add_argument("--teacher-steps", type=int, default=None)
+    ap.add_argument("--student-steps", type=int, default=None)
     args = ap.parse_args()
     if args.plot_all_seeds and args.resume:
         ap.error(

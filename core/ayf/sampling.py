@@ -2,9 +2,9 @@
 Gaussian-prior AYF sampling utilities (return latent tensors, no decoding).
 
 Identical to core.ayf_rf.sampling except the noise prior:
-    z0 ~ N(0, sigma_data² I)   instead of Uniform[-1, 1]^d
+    z0 ~ N(0, base_std² I)   instead of Uniform[-1, 1]^d
 
-    sample_noise                    – z0 ~ N(0, sigma_data² I)
+    sample_noise                    – z0 ~ N(0, base_std² I)
     sample_ayf_time_pair        – re-exported from core.ayf_rf (unchanged)
     integrate_teacher_interval      – re-exported from core.ayf_rf (unchanged)
     integrate_teacher_to_data       – re-exported from core.ayf_rf (unchanged)
@@ -30,10 +30,10 @@ def sample_noise(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
 ) -> torch.Tensor:
-    """z0 ~ N(0, sigma_data² I)  [B, D]."""
-    return sigma_data * torch.randn(batch_size, latent_dim, device=device)
+    """Sample ``z0 ~ N(0, base_std² I)`` with shape ``[B, D]``."""
+    return base_std * torch.randn(batch_size, latent_dim, device=device)
 
 
 @torch.no_grad()
@@ -42,11 +42,11 @@ def sample_teacher_latents(
     n: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
     steps: int = 64,
 ) -> torch.Tensor:
-    """Full Euler ODE from z0 ~ N(0, sigma_data² I) to z1."""
-    z = sample_noise(n, latent_dim, device, sigma_data)
+    """Full Euler ODE from ``z0 ~ N(0, base_std² I)`` to ``z1``."""
+    z = sample_noise(n, latent_dim, device, base_std)
     t_start = torch.zeros(n, 1, device=device)
     return integrate_teacher_to_data(teacher, z, t_start, steps=steps)
 
@@ -57,10 +57,10 @@ def sample_student_latents_one_step(
     n: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
 ) -> torch.Tensor:
-    """One-step: C(z0, 0, 1) with z0 ~ N(0, sigma_data² I)."""
-    z0 = sample_noise(n, latent_dim, device, sigma_data)
+    """One-step: ``C(z0, 0, 1)`` with a Gaussian base sample."""
+    z0 = sample_noise(n, latent_dim, device, base_std)
     t0 = torch.zeros(n, 1, device=device)
     s1 = torch.ones(n, 1, device=device)
     return student(z0, t0, s1)
@@ -73,7 +73,7 @@ def sample_student_latents_k_step(
     latent_dim: int,
     device: str | torch.device,
     k: int = 4,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
     schedule: str = "uniform",
 ) -> torch.Tensor:
     """
@@ -83,7 +83,7 @@ def sample_student_latents_k_step(
     schedule: "uniform" | "quadratic" | "sqrt"
     """
     assert k >= 1
-    z = sample_noise(n, latent_dim, device, sigma_data)
+    z = sample_noise(n, latent_dim, device, base_std)
 
     base = torch.linspace(0.0, 1.0, k + 1, device=device)
     if schedule == "uniform":

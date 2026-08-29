@@ -11,18 +11,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass, field
 
 import torch
 
+from core import ayf as A
 from core import edm as E
 from toy.common import (
     ToyAE,
+    evaluate_density_outputs,
     make_data_sampler,
     make_latent_sampler,
     save_benchmark_figure,
     save_metrics,
-    sliced_wasserstein_distance,
+    save_evaluation_samples,
     train_toy_ae,
 )
 
@@ -43,39 +46,38 @@ class Config:
     ae_depth: int = 2
     ae_steps: int = 20000
     ae_lr: float = 1e-3
-    latent_reg_weight: float = 1e-3
-
     # EDM teacher
     depth: int = 4
     edm_teacher_steps: int = 10000
     edm_teacher_lr: float = 1e-3
 
     # EDM noise
-    sigma_data: float = 0.5
-    sigma_min: float = 0.002
-    # sigma_max must be large relative to sigma_data for N(0, sigma_max^2) to
-    # stand in for p_{sigma_max}; at 2.0 (~3.5x) the student's one-shot map
-    # starts measurably off-distribution.
-    sigma_max: float = 5.0
+    sigma_data: float = 1.0
+    sigma_min: float = 0.004
+    # Exact 2x scaling of the published sigma_data=0.5 EDM configuration for
+    # unit-standardized latents.
+    sigma_max: float = 160.0
     edm_rho: float = 7.0
-    edm_p_mean: float = -1.2
+    edm_p_mean: float = -1.2 + math.log(2.0)
     edm_p_std: float = 1.2
 
-    # EDM AYF student
-    edm_student_steps: int = 10000
-    edm_student_lr: float = 1e-3
-    train_mode: str = "emd"   # "emd" | "lmd" | "emd+lmd"
-    edm_lmd_weight: float = 0.1
-    edm_time_eps: float = 1e-4
-    edm_interval_p_mean: float = -0.6
-    edm_interval_p_std: float = 1.6
-    edm_jvp_dt_ref: float = 1.0
-    # Floor of the student's normalized-time parameterisation. The PF-ODE is
-    # already the identity below ~sigma_data / 10, so carrying the teacher's
-    # sigma_min down to 0.002 would spend ~47% of t in [0, 1] transporting
-    # nothing (and 4 of 8 k-step intervals inside that dead zone).
-    edm_student_sigma_min: float = 0.05
-    edm_eval_teacher_ode_steps: int = 32
+    # AYF student. The EDM teacher is wrapped as a flow-matching velocity
+    # field, so this arm uses the same student, objective, interval schedule
+    # and samplers as the two RF arms; only the teacher and base scale differ.
+    student_steps: int = 10000
+    student_lr: float = 1e-3
+    train_mode: str = "emd"  # "emd" | "emd+lmd"
+    emd_weight: float = 1.0
+    lmd_weight: float = 0.0
+    jvp_dt_ref: float = 1.0
+    time_eps: float = 1e-4
+    # Shared AYF Algorithm 1 interval schedule (same values in every arm).
+    interval_p_mean: float = -0.6
+    interval_p_std: float = 1.6
+    eval_teacher_ode_steps: int = 32
+    # Base distribution of the flow-matching interpolant, z_0 ~ N(0, base_std^2 I).
+    # Matched to sigma_data because the latents carry unit global scale.
+    base_std: float = 1.0
 
     # Sampling / visualisation
     batch_size: int = 64
@@ -107,16 +109,14 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
     )
     teacher_samples = ae.decode(teacher_z).cpu()
 
-    s1_z = E.sample_edm_ayf_latents_one_step(
-        student, n, cfg.latent_dim, cfg.device, sigma_max=cfg.sigma_max
+    s1_z = A.sample_student_latents_one_step(
+        student, n, cfg.latent_dim, cfg.device, base_std=cfg.base_std,
     )
     s1 = ae.decode(s1_z).cpu()
 
-    sk_z = E.sample_edm_ayf_latents_k_step(
+    sk_z = A.sample_student_latents_k_step(
         student, n, cfg.latent_dim, cfg.device,
-        k=cfg.edm_student_sample_k,
-        sigma_min=cfg.edm_student_sigma_min, sigma_max=cfg.sigma_max,
-        rho=cfg.edm_rho,
+        k=cfg.edm_student_sample_k, base_std=cfg.base_std,
     )
     sk = ae.decode(sk_z).cpu()
 
@@ -129,13 +129,16 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
     ]
     if cfg.save_figure:
         save_benchmark_figure(panels, cfg.out.format(cfg.dataset))
-    metrics = {
-        "ae_reconstruction_swd": sliced_wasserstein_distance(data, x_hat),
-        "teacher_swd": sliced_wasserstein_distance(data, teacher_samples),
-        "student_1_step_swd": sliced_wasserstein_distance(data, s1),
-        f"student_{cfg.edm_student_sample_k}_step_swd": sliced_wasserstein_distance(data, sk),
+    outputs = {
+        "ae_reconstruction": x_hat,
+        "teacher": teacher_samples,
+        "student_1_step": s1,
+        f"student_{cfg.edm_student_sample_k}_step": sk,
     }
-    save_metrics(metrics, cfg.metrics_out.format(cfg.dataset))
+    metrics_path = cfg.metrics_out.format(cfg.dataset)
+    metrics = evaluate_density_outputs(cfg.dataset, data, outputs)
+    save_evaluation_samples(data, outputs, metrics_path)
+    save_metrics(metrics, metrics_path)
     return metrics
 
 
@@ -146,15 +149,15 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
 def main(cfg: Config | None = None):
     if cfg is None:
         ap = argparse.ArgumentParser()
-        ap.add_argument("--dataset", default="8gaussians",
-                        choices=["8gaussians", "two_moons", "checkerboard"])
-        ap.add_argument("--latent_dim", type=int, default=32)
-        ap.add_argument("--teacher_steps", type=int, default=None)
-        ap.add_argument("--student_steps", type=int, default=None)
         ap.add_argument(
-            "--student_mode",
-            default="emd",
-            choices=["emd", "lmd", "emd+lmd"],
+            "--dataset", default="8gaussians",
+            choices=["8gaussians", "two_moons", "checkerboard"],
+        )
+        ap.add_argument("--latent-dim", type=int, default=32)
+        ap.add_argument("--teacher-steps", type=int, default=None)
+        ap.add_argument("--student-steps", type=int, default=None)
+        ap.add_argument(
+            "--student-mode", default="emd", choices=["emd", "emd+lmd"],
         )
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
@@ -169,7 +172,7 @@ def main(cfg: Config | None = None):
         if args.teacher_steps is not None:
             cfg.edm_teacher_steps = args.teacher_steps
         if args.student_steps is not None:
-            cfg.edm_student_steps = args.student_steps
+            cfg.student_steps = args.student_steps
     print(cfg)
     torch.manual_seed(cfg.seed)
 
@@ -189,17 +192,24 @@ def main(cfg: Config | None = None):
 
     # EDM teacher
     teacher = E.EDMPrecondDenoiser(
-        cfg.latent_dim, cfg.hidden, cfg.depth, cfg.sigma_data
+        cfg.latent_dim, cfg.hidden, cfg.depth, cfg.sigma_data,
     ).to(cfg.device)
     print("\nTraining EDM teacher...")
     E.train_edm_teacher(teacher, latent_sampler, cfg)
 
-    # AYF interval student driven by the EDM probability-flow ODE.
-    student = E.EDMIntervalFlowMap(
-        cfg.latent_dim, cfg.hidden, cfg.depth
+    # Align Your Flow distils diffusion teachers inside the flow-matching
+    # framework, so the EDM denoiser is exposed as a velocity field and the
+    # shared RF AYF student is trained against it unchanged.
+    flow_teacher = E.EDMFlowVelocity(
+        teacher, sigma_min=cfg.sigma_min, sigma_max=cfg.sigma_max,
+    ).to(cfg.device)
+    student = A.RFIntervalFlowMap(
+        cfg.latent_dim, cfg.hidden, cfg.depth,
     ).to(cfg.device)
     print(f"\nTraining EDM + AYF student ({cfg.train_mode})...")
-    E.train_edm_student_ayf(student, teacher, latent_sampler, cfg)
+    if cfg.train_mode == "emd+lmd" and cfg.lmd_weight <= 0.0:
+        raise ValueError("train_mode 'emd+lmd' requires lmd_weight > 0")
+    A.train_student_ayf(student, flow_teacher, latent_sampler, cfg)
 
     print("\nPlotting...")
     return make_plot(ae, teacher, student, data_sampler, cfg)

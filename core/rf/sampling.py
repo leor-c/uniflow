@@ -24,7 +24,7 @@ def sample_gaussian_noise(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma: float = 0.5,
+    sigma: float = 1.0,
 ) -> torch.Tensor:
     """Sample ``N(0, sigma^2 I)``."""
     return sigma * torch.randn(batch_size, latent_dim, device=device)

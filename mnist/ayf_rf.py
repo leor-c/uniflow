@@ -1,7 +1,7 @@
 """
 AYF-style interval flow map experiment on MNIST.
 
-Applies the bounded RF + AYF experiment to MNIST latents.
+Applies the Uniform RF + AYF experiment to MNIST latents.
 
 Pipeline:
   1. Train convolutional AE (28×28 → latent_dim-d bounded latent).

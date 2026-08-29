@@ -10,6 +10,7 @@ runs/
 !results/*.png
 !results/*.json
 .DS_Store
+metrics.md
 build/
 dist/
 *.egg-info/

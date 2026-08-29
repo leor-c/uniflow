@@ -17,9 +17,11 @@ from dataclasses import dataclass, field
 
 import torch
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from core import ayf as A
 from core import edm as E
 from core.autoencoder import freeze
 from mnist.ae import (
@@ -62,19 +64,20 @@ class Config:
     edm_p_mean: float = -1.2
     edm_p_std: float = 1.2
 
-    # EDM AYF student
-    edm_student_steps: int = 20000
-    edm_student_lr: float = 1e-3
-    train_mode: str = "emd"   # "emd" | "lmd" | "emd+lmd"
-    edm_lmd_weight: float = 0.1
-    edm_time_eps: float = 1e-4
-    edm_interval_p_mean: float = -0.6
-    edm_interval_p_std: float = 1.6
-    edm_jvp_dt_ref: float = 1.0
-    # See toy/edm_baseline.py: the student's normalized time must not extend
-    # into the range where the PF-ODE is already the identity map.
-    edm_student_sigma_min: float = 0.05
-    edm_eval_teacher_ode_steps: int = 32
+    # AYF student. The teacher is wrapped as a flow-matching velocity field,
+    # so these are the shared AYF field names read by core.ayf.
+    student_steps: int = 20000
+    student_lr: float = 1e-3
+    train_mode: str = "emd"  # "emd" | "emd+lmd"
+    emd_weight: float = 1.0
+    lmd_weight: float = 0.0
+    jvp_dt_ref: float = 1.0
+    time_eps: float = 1e-4
+    interval_p_mean: float = -0.6
+    interval_p_std: float = 1.6
+    eval_teacher_ode_steps: int = 32
+    # Base distribution of the flow-matching interpolant.
+    base_std: float = 1.0
 
     # Sampling
     batch_size: int = 256
@@ -95,7 +98,7 @@ def fast_cpu_config(**overrides) -> Config:
         ae_lr=1e-3,
         ae_batch_size=32,
         edm_teacher_steps=16000,
-        edm_student_steps=16000,
+        student_steps=16000,
         batch_size=64,
         edm_teacher_sample_steps=256,
         log_every=100,
@@ -142,24 +145,28 @@ def make_plots(ae: MNISTAutoEncoder, teacher, student, cfg: Config, loader):
         sigma_min=cfg.sigma_min, sigma_max=cfg.sigma_max,
         rho=cfg.edm_rho, steps=cfg.edm_teacher_sample_steps,
     )
-    save_image_grid(ae.decode(tz), os.path.join(cfg.out_dir, "teacher_samples.png"),
-                    title="EDM Teacher (ODE)")
-
-    s1z = E.sample_edm_ayf_latents_one_step(
-        student, n, cfg.latent_dim, cfg.device, sigma_max=cfg.sigma_max
+    save_image_grid(
+        ae.decode(tz), os.path.join(cfg.out_dir, "teacher_samples.png"),
+        title="EDM Teacher (ODE)",
     )
-    save_image_grid(ae.decode(s1z), os.path.join(cfg.out_dir, "student_1step.png"),
-                    title="EDM + AYF 1-step")
 
-    skz = E.sample_edm_ayf_latents_k_step(
+    s1z = A.sample_student_latents_one_step(
+        student, n, cfg.latent_dim, cfg.device, base_std=cfg.base_std,
+    )
+    save_image_grid(
+        ae.decode(s1z), os.path.join(cfg.out_dir, "student_1step.png"),
+        title="EDM + AYF 1-step",
+    )
+
+    skz = A.sample_student_latents_k_step(
         student, n, cfg.latent_dim, cfg.device,
-        k=cfg.edm_student_sample_k,
-        sigma_min=cfg.edm_student_sigma_min, sigma_max=cfg.sigma_max,
-        rho=cfg.edm_rho,
+        k=cfg.edm_student_sample_k, base_std=cfg.base_std,
     )
-    save_image_grid(ae.decode(skz),
-                    os.path.join(cfg.out_dir, f"student_{cfg.edm_student_sample_k}step.png"),
-                    title=f"EDM + AYF {cfg.edm_student_sample_k}-step")
+    save_image_grid(
+        ae.decode(skz),
+        os.path.join(cfg.out_dir, f"student_{cfg.edm_student_sample_k}step.png"),
+        title=f"EDM + AYF {cfg.edm_student_sample_k}-step",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +176,10 @@ def make_plots(ae: MNISTAutoEncoder, teacher, student, cfg: Config, loader):
 def main(cfg: Config | None = None):
     if cfg is None:
         ap = argparse.ArgumentParser()
-        ap.add_argument("--fast", action="store_true",
-                        help="Use reduced config for CPU-only runs (~15-25 min)")
+        ap.add_argument(
+            "--fast", action="store_true",
+            help="Use reduced config for CPU-only runs (~15-25 min)",
+        )
         ap.add_argument("--latent_dim", type=int, default=None)
         ap.add_argument("--ae_steps", type=int, default=None)
         ap.add_argument("--teacher_steps", type=int, default=None)
@@ -191,7 +200,7 @@ def main(cfg: Config | None = None):
         if args.teacher_steps is not None:
             cfg.edm_teacher_steps = args.teacher_steps
         if args.student_steps is not None:
-            cfg.edm_student_steps = args.student_steps
+            cfg.student_steps = args.student_steps
         cfg.train_mode = args.student_mode
         cfg.out_dir = args.out_dir
         cfg.data_root = args.data_root
@@ -202,7 +211,7 @@ def main(cfg: Config | None = None):
 
     # --- Data ---
     train_loader = make_mnist_data_loader(
-        cfg.data_root, train=True, batch_size=cfg.ae_batch_size
+        cfg.data_root, train=True, batch_size=cfg.ae_batch_size,
     )
 
     # --- AE ---
@@ -221,27 +230,34 @@ def main(cfg: Config | None = None):
     # --- Pre-encode training set ---
     print("\nEncoding training data...")
     all_latents = encode_dataset(ae, train_loader, cfg.device)
-    print(f"  latents: {all_latents.shape}  "
-          f"mean_abs={all_latents.abs().mean():.3f}  "
-          f"max_abs={all_latents.abs().max():.3f}")
+    print(
+        f"  latents: {all_latents.shape}  "
+        f"mean_abs={all_latents.abs().mean():.3f}  "
+        f"max_abs={all_latents.abs().max():.3f}",
+    )
     freeze(ae)
 
     latent_sampler = make_mnist_latent_sampler(all_latents, cfg.device)
 
     # --- EDM teacher ---
     teacher = E.EDMPrecondDenoiser(
-        cfg.latent_dim, cfg.hidden, cfg.depth, cfg.sigma_data
+        cfg.latent_dim, cfg.hidden, cfg.depth, cfg.sigma_data,
     ).to(cfg.device)
     print("\nTraining EDM teacher in latent space...")
     E.train_edm_teacher(teacher, latent_sampler, cfg)
     torch.save(teacher.state_dict(), os.path.join(cfg.out_dir, "teacher.pt"))
 
     # --- EDM AYF student ---
-    student = E.EDMIntervalFlowMap(
-        cfg.latent_dim, cfg.hidden, cfg.depth
+    # The teacher is exposed as a flow-matching velocity field, so the shared
+    # RF AYF student and objective drive it unchanged (see core.edm.flow).
+    flow_teacher = E.EDMFlowVelocity(
+        teacher, sigma_min=cfg.sigma_min, sigma_max=cfg.sigma_max,
+    ).to(cfg.device)
+    student = A.RFIntervalFlowMap(
+        cfg.latent_dim, cfg.hidden, cfg.depth,
     ).to(cfg.device)
     print(f"\nTraining EDM + AYF student ({cfg.train_mode})...")
-    E.train_edm_student_ayf(student, teacher, latent_sampler, cfg)
+    A.train_student_ayf(student, flow_teacher, latent_sampler, cfg)
     torch.save(student.state_dict(), os.path.join(cfg.out_dir, "student.pt"))
 
     # --- Visualise ---

@@ -1,21 +1,66 @@
 import unittest
 from argparse import Namespace
 
+from toy.common import BENCHMARK_PROTOCOL, DENSITY_PROTOCOL
 from toy.run_all import (
+    METRIC_SUFFIXES,
+    OUTPUT_PREFIXES,
     _aggregate,
+    _apply_overrides,
     _configure_multi_seed_outputs,
+    _has_current_metric_schema,
     _render_markdown_summary,
     _worker_count,
 )
 
 
 class _Config:
+    dataset = "8gaussians"
+    seed = 1
+    latent_dim = 32
+    ae_steps = 20_000
+    teacher_steps = 10_000
+    student_steps = 10_000
     metrics_out = ""
     out = ""
     save_figure = False
 
 
+def _pipeline_metrics(value: float, *, protocol: bool = False) -> dict:
+    metrics = {
+        f"{output}_{suffix}": value
+        for output in OUTPUT_PREFIXES
+        for suffix in METRIC_SUFFIXES
+    }
+    if protocol:
+        metrics["benchmark_protocol"] = BENCHMARK_PROTOCOL
+        metrics["evaluation_protocol"] = DENSITY_PROTOCOL
+    return metrics
+
+
 class RunAllAggregationTests(unittest.TestCase):
+    def test_shared_overrides_include_latent_dimension(self):
+        cfg = _Config()
+        args = Namespace(
+            dataset=None,
+            latent_dim=8,
+            ae_steps=None,
+            teacher_steps=None,
+            student_steps=None,
+        )
+
+        result = _apply_overrides(
+            cfg,
+            args,
+            seed=3,
+            teacher_field="teacher_steps",
+            student_field="student_steps",
+        )
+
+        self.assertIs(result, cfg)
+        self.assertEqual(cfg.latent_dim, 8)
+        self.assertEqual(cfg.seed, 3)
+
     def test_cuda_parallelizes_all_pending_seeds_by_default(self):
         self.assertEqual(_worker_count(True, pending_seeds=5, requested=None), 5)
 
@@ -55,45 +100,86 @@ class RunAllAggregationTests(unittest.TestCase):
 
     def test_aggregate_reports_seed_values_mean_and_sample_std(self):
         all_metrics = {
-            1: {
-                pipeline: {"teacher_swd": 1.0, "student_1_step_swd": 2.0}
-                for pipeline in ("bounded_rf", "gaussian_rf", "edm_ayf")
-            },
-            2: {
-                pipeline: {"teacher_swd": 3.0, "student_1_step_swd": 4.0}
-                for pipeline in ("bounded_rf", "gaussian_rf", "edm_ayf")
-            },
+            seed: {
+                pipeline: _pipeline_metrics(float(2 * seed - 1))
+                for pipeline in ("uniform_rf", "gaussian_rf", "edm_ayf")
+            }
+            for seed in (1, 2)
         }
 
         result = _aggregate(all_metrics)
 
         self.assertEqual(result["num_seeds"], 2)
         self.assertEqual(result["seeds"], [1, 2])
-        teacher = result["pipelines"]["edm_ayf"]["teacher_swd"]
+        teacher = result["pipelines"]["edm_ayf"]["teacher_target_nll"]
         self.assertEqual(teacher["values"], {"1": 1.0, "2": 3.0})
         self.assertEqual(teacher["mean"], 2.0)
         self.assertAlmostEqual(teacher["std"], 2**0.5)
+        self.assertEqual(result["metric"], "two-sided density fidelity and coverage")
+        self.assertEqual(result["metric_samples"], 2048)
+        self.assertEqual(result["off_support_threshold"], "three target noise scales")
 
-    def test_markdown_summary_contains_aggregate_table(self):
+    def test_markdown_summary_contains_density_tables(self):
         all_metrics = {
             seed: {
-                pipeline: {
-                    "teacher_swd": float(seed),
-                    "student_1_step_swd": float(seed + 1),
-                    "student_8_step_swd": float(seed + 2),
-                }
-                for pipeline in ("bounded_rf", "gaussian_rf", "edm_ayf")
+                pipeline: _pipeline_metrics(float(seed))
+                for pipeline in ("uniform_rf", "gaussian_rf", "edm_ayf")
             }
             for seed in (1, 2)
         }
 
-        report = _render_markdown_summary(_aggregate(all_metrics), "8gaussians")
+        report = _render_markdown_summary(_aggregate(all_metrics), "two_moons")
 
-        self.assertIn("# 8-Gaussians benchmark results", report)
-        self.assertIn("| Pipeline | Teacher | Student, 1 step | Student, 8 steps |", report)
-        self.assertIn("| Bounded RF + AYF | 1.500 ± 0.707", report)
-        self.assertIn("| EDM + AYF | 1.500 ± 0.707", report)
-        self.assertIn("summary_8gaussians.json", report)
+        self.assertIn("# two moons benchmark results", report)
+        self.assertIn("## Teacher", report)
+        self.assertIn("## Student, 1 step", report)
+        self.assertIn("Fidelity: target NLL ↓", report)
+        self.assertIn("Coverage: KDE NLL ↓", report)
+        self.assertIn("Off support (>3σ) ↓", report)
+        self.assertIn("| Uniform RF + AYF | 1.500 ± 0.707", report)
+        self.assertIn("150.0% ± 70.7%", report)
+        self.assertIn("Aggregate target-NLL comparison", report)
+        self.assertIn("summary_two_moons.json", report)
+
+    def test_current_schema_rejects_mmd_metrics(self):
+        old = {
+            pipeline: {
+                "evaluation_protocol": "biased-multiscale-rbf-mmd-uniform-without-replacement-v1",
+                "ae_reconstruction_mmd": 0.1,
+                "teacher_mmd": 0.2,
+                "student_1_step_mmd": 0.3,
+                "student_8_step_mmd": 0.4,
+            }
+            for pipeline in ("uniform_rf", "gaussian_rf", "edm_ayf")
+        }
+
+        self.assertFalse(_has_current_metric_schema(old))
+
+    def test_current_schema_rejects_missing_coverage_metric(self):
+        incomplete = {
+            pipeline: _pipeline_metrics(0.1, protocol=True)
+            for pipeline in ("uniform_rf", "gaussian_rf", "edm_ayf")
+        }
+        del incomplete["gaussian_rf"]["teacher_coverage_nll"]
+
+        self.assertFalse(_has_current_metric_schema(incomplete))
+
+    def test_current_schema_rejects_previous_benchmark_protocol(self):
+        previous = {
+            pipeline: _pipeline_metrics(0.1, protocol=True)
+            for pipeline in ("uniform_rf", "gaussian_rf", "edm_ayf")
+        }
+        previous["gaussian_rf"]["benchmark_protocol"] = "previous-baseline"
+
+        self.assertFalse(_has_current_metric_schema(previous))
+
+    def test_current_schema_accepts_density_metrics(self):
+        current = {
+            pipeline: _pipeline_metrics(0.1, protocol=True)
+            for pipeline in ("uniform_rf", "gaussian_rf", "edm_ayf")
+        }
+
+        self.assertTrue(_has_current_metric_schema(current))
 
 
 if __name__ == "__main__":

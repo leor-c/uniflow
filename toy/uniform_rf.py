@@ -1,11 +1,11 @@
 """
-Uniform-prior, tanh-bounded RF + AYF toy benchmark.
+Uniform RF + AYF toy benchmark.
 
 The RF teacher and AYF student operate in the same compact latent cube.
 
 Usage:
-    python -m toy.bounded_rf
-    python -m toy.bounded_rf --dataset two_moons
+    python -m toy.uniform_rf
+    python -m toy.uniform_rf --dataset two_moons
 """
 
 from __future__ import annotations
@@ -19,11 +19,12 @@ from core import rf as R
 from core import ayf_rf as A
 from toy.common import (
     ToyAE,
+    evaluate_density_outputs,
     make_data_sampler,
     make_latent_sampler,
     save_benchmark_figure,
     save_metrics,
-    sliced_wasserstein_distance,
+    save_evaluation_samples,
     train_toy_ae,
 )
 
@@ -79,8 +80,8 @@ class Config:
 
     log_every: int = 500
     save_figure: bool = True
-    out: str = "results/bounded_rf_{}.png"
-    metrics_out: str = "results/bounded_rf_{}.json"
+    out: str = "results/uniform_rf_{}.png"
+    metrics_out: str = "results/uniform_rf_{}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -112,19 +113,22 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
     panels = [
         ("Data", data),
         ("AE recon", x_hat),
-        ("Bounded RF (ODE)", teacher_samples),
-        ("Bounded RF + AYF (1-step)", s1),
-        (f"Bounded RF + AYF ({cfg.sample_k}-step)", sk),
+        ("Uniform RF (ODE)", teacher_samples),
+        ("Uniform RF + AYF (1-step)", s1),
+        (f"Uniform RF + AYF ({cfg.sample_k}-step)", sk),
     ]
     if cfg.save_figure:
         save_benchmark_figure(panels, cfg.out.format(cfg.dataset))
-    metrics = {
-        "ae_reconstruction_swd": sliced_wasserstein_distance(data, x_hat),
-        "teacher_swd": sliced_wasserstein_distance(data, teacher_samples),
-        "student_1_step_swd": sliced_wasserstein_distance(data, s1),
-        f"student_{cfg.sample_k}_step_swd": sliced_wasserstein_distance(data, sk),
+    outputs = {
+        "ae_reconstruction": x_hat,
+        "teacher": teacher_samples,
+        "student_1_step": s1,
+        f"student_{cfg.sample_k}_step": sk,
     }
-    save_metrics(metrics, cfg.metrics_out.format(cfg.dataset))
+    metrics_path = cfg.metrics_out.format(cfg.dataset)
+    metrics = evaluate_density_outputs(cfg.dataset, data, outputs)
+    save_evaluation_samples(data, outputs, metrics_path)
+    save_metrics(metrics, metrics_path)
     return metrics
 
 
@@ -137,10 +141,11 @@ def main(cfg: Config | None = None):
         ap = argparse.ArgumentParser()
         ap.add_argument("--dataset", default="8gaussians",
                         choices=["8gaussians", "two_moons", "checkerboard"])
-        ap.add_argument("--latent_dim", type=int, default=32)
-        ap.add_argument("--teacher_steps", type=int, default=None)
-        ap.add_argument("--student_steps", type=int, default=None)
-        ap.add_argument("--train_mode", default="emd", choices=["emd", "ct"])
+        ap.add_argument("--latent-dim", type=int, default=32)
+        ap.add_argument("--teacher-steps", type=int, default=None)
+        ap.add_argument("--student-steps", type=int, default=None)
+        ap.add_argument("--train-mode", default="emd", choices=["emd", "ct"])
+        ap.add_argument("--ae-latent-reg-weight", type=float, default=1e-3)
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
@@ -148,8 +153,9 @@ def main(cfg: Config | None = None):
             dataset=args.dataset,
             latent_dim=args.latent_dim,
             train_mode=args.train_mode,
+            latent_reg_weight=args.ae_latent_reg_weight,
             seed=args.seed,
-            out=args.out or f"results/bounded_rf_{args.dataset}.png",
+            out=args.out or f"results/uniform_rf_{args.dataset}.png",
         )
         if args.teacher_steps is not None:
             cfg.teacher_steps = args.teacher_steps

@@ -1,6 +1,6 @@
 """
 AYF losses — identical to core.ayf_rf.losses except the noise prior:
-    z0 ~ N(0, sigma_data² I)   instead of Uniform[-1, 1]^d
+    z0 ~ N(0, base_std² I)   instead of Uniform[-1, 1]^d
 
 The teacher is the same RFTeacher (velocity field), trained on Gaussian paths.
 All JVP objectives carry over unchanged.
@@ -21,6 +21,7 @@ from torch.func import jvp
 
 from ..rf.models import RFTeacher
 from ..ayf_rf.models import RFIntervalFlowMap
+from ..ayf_rf.losses import normalize_tangent
 from ..ayf_rf.sampling import sample_ayf_time_pair
 from ..ayf_rf.sampling import integrate_teacher_interval, integrate_teacher_to_data
 from .sampling import sample_noise
@@ -33,20 +34,20 @@ def ayf_emd_loss(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
     jvp_dt_ref: float = 1.0,
     time_eps: float = 1e-4,
     interval_p_mean: float = -0.6,
     interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
-    AYF EMD loss with Gaussian noise z0 ~ N(0, sigma_data² I).
+    AYF EMD loss with Gaussian noise ``z0 ~ N(0, base_std² I)``.
 
     Source-time JVP:  ∂_t C(z,t,s) + J_z C(z,t,s) v_φ(z,t) = 0
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device, sigma_data)
+    z0 = sample_noise(batch_size, latent_dim, device, base_std)
     t, s = sample_ayf_time_pair(
         batch_size, device, eps=time_eps,
         p_mean=interval_p_mean, p_std=interval_p_std,
@@ -62,8 +63,7 @@ def ayf_emd_loss(
         tangents=(v, torch.ones_like(t)),
     )
 
-    norm = torch.sqrt(1.0 + v.pow(2).mean(dim=-1, keepdim=True)).detach()
-    residual = tangent / norm
+    residual = normalize_tangent(tangent)
     return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
@@ -74,7 +74,7 @@ def ayf_lmd_loss(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
     jvp_dt_ref: float = 1.0,
     time_eps: float = 1e-4,
     interval_p_mean: float = -0.6,
@@ -87,7 +87,7 @@ def ayf_lmd_loss(
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device, sigma_data)
+    z0 = sample_noise(batch_size, latent_dim, device, base_std)
     t, s = sample_ayf_time_pair(
         batch_size, device, eps=time_eps,
         p_mean=interval_p_mean, p_std=interval_p_std,
@@ -103,8 +103,7 @@ def ayf_lmd_loss(
     with torch.no_grad():
         v_target = teacher(z_s_hat, s)
 
-    norm = torch.sqrt(1.0 + v_target.pow(2).mean(dim=-1, keepdim=True)).detach()
-    residual = (dC_ds - v_target) / norm
+    residual = normalize_tangent(dC_ds - v_target)
     return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
@@ -116,13 +115,13 @@ def ayf_endpoint_eval_loss(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
     time_eps: float = 1e-4,
     ode_steps: int = 32,
 ) -> torch.Tensor:
     """Eval-only: C(z_t, t, 1) vs teacher ODE target."""
     z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device, sigma_data)
+    z0 = sample_noise(batch_size, latent_dim, device, base_std)
     t = torch.rand(batch_size, 1, device=device).clamp(time_eps, 1.0 - time_eps)
     s = torch.ones_like(t)
     zt = (1.0 - t) * z0 + t * z1
@@ -139,7 +138,7 @@ def ayf_interval_eval_loss(
     batch_size: int,
     latent_dim: int,
     device: str | torch.device,
-    sigma_data: float = 0.5,
+    base_std: float = 1.0,
     time_eps: float = 1e-4,
     interval_p_mean: float = -0.6,
     interval_p_std: float = 1.6,
@@ -147,7 +146,7 @@ def ayf_interval_eval_loss(
 ) -> torch.Tensor:
     """Eval-only: C(z_t, t, s) vs teacher ODE interval target."""
     z1 = latent_sampler(batch_size)
-    z0 = sample_noise(batch_size, latent_dim, device, sigma_data)
+    z0 = sample_noise(batch_size, latent_dim, device, base_std)
     t, s = sample_ayf_time_pair(
         batch_size, device, eps=time_eps,
         p_mean=interval_p_mean, p_std=interval_p_std,

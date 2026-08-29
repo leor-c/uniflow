@@ -1,8 +1,8 @@
 """
 Gaussian-prior RF + AYF toy benchmark.
 
-Same architecture as ``toy.bounded_rf``. The principal difference is the
-noise prior: z0 ~ N(0, sigma_data² I) instead of Uniform[-1, 1]^d.
+Same architecture as ``toy.uniform_rf``. The principal difference is the
+noise prior: z0 ~ N(0, I) instead of Uniform[-1, 1]^d.
 The teacher is the same RFTeacher (velocity field), trained on Gaussian paths.
 
 Usage:
@@ -21,11 +21,12 @@ from core.rf import RFTeacher
 from core import ayf as A
 from toy.common import (
     ToyAE,
+    evaluate_density_outputs,
     make_data_sampler,
     make_latent_sampler,
     save_benchmark_figure,
     save_metrics,
-    sliced_wasserstein_distance,
+    save_evaluation_samples,
     train_toy_ae,
 )
 
@@ -40,18 +41,17 @@ class Config:
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     seed: int = 1
 
-    # AE (same architecture as bounded_rf for fair comparison)
+    # AE (same architecture as uniform_rf for fair comparison)
     latent_dim: int = 32
     hidden: int = 128
     ae_depth: int = 2
     ae_steps: int = 20000
     ae_lr: float = 1e-3
-    latent_reg_weight: float = 1e-3
 
-    # Gaussian noise scale
-    sigma_data: float = 0.5
+    # Standard Gaussian base distribution
+    base_std: float = 1.0
 
-    # RF teacher (same architecture as bounded_rf)
+    # RF teacher (same architecture as uniform_rf)
     depth: int = 4
     teacher_steps: int = 10000
     teacher_lr: float = 1e-3
@@ -97,18 +97,18 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
 
     teacher_z = A.sample_teacher_latents(
         teacher, n, cfg.latent_dim, cfg.device,
-        sigma_data=cfg.sigma_data, steps=cfg.teacher_sample_steps,
+        base_std=cfg.base_std, steps=cfg.teacher_sample_steps,
     )
     teacher_samples = ae.decode(teacher_z).cpu()
 
     s1_z = A.sample_student_latents_one_step(
-        student, n, cfg.latent_dim, cfg.device, sigma_data=cfg.sigma_data,
+        student, n, cfg.latent_dim, cfg.device, base_std=cfg.base_std,
     )
     s1 = ae.decode(s1_z).cpu()
 
     sk_z = A.sample_student_latents_k_step(
         student, n, cfg.latent_dim, cfg.device,
-        k=cfg.sample_k, sigma_data=cfg.sigma_data, schedule=cfg.sample_schedule,
+        k=cfg.sample_k, base_std=cfg.base_std, schedule=cfg.sample_schedule,
     )
     sk = ae.decode(sk_z).cpu()
 
@@ -121,13 +121,16 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
     ]
     if cfg.save_figure:
         save_benchmark_figure(panels, cfg.out.format(cfg.dataset))
-    metrics = {
-        "ae_reconstruction_swd": sliced_wasserstein_distance(data, x_hat),
-        "teacher_swd": sliced_wasserstein_distance(data, teacher_samples),
-        "student_1_step_swd": sliced_wasserstein_distance(data, s1),
-        f"student_{cfg.sample_k}_step_swd": sliced_wasserstein_distance(data, sk),
+    outputs = {
+        "ae_reconstruction": x_hat,
+        "teacher": teacher_samples,
+        "student_1_step": s1,
+        f"student_{cfg.sample_k}_step": sk,
     }
-    save_metrics(metrics, cfg.metrics_out.format(cfg.dataset))
+    metrics_path = cfg.metrics_out.format(cfg.dataset)
+    metrics = evaluate_density_outputs(cfg.dataset, data, outputs)
+    save_evaluation_samples(data, outputs, metrics_path)
+    save_metrics(metrics, metrics_path)
     return metrics
 
 
@@ -140,18 +143,18 @@ def main(cfg: Config | None = None):
         ap = argparse.ArgumentParser()
         ap.add_argument("--dataset", default="8gaussians",
                         choices=["8gaussians", "two_moons", "checkerboard"])
-        ap.add_argument("--latent_dim", type=int, default=32)
-        ap.add_argument("--teacher_steps", type=int, default=None)
-        ap.add_argument("--student_steps", type=int, default=None)
-        ap.add_argument("--train_mode", default="emd", choices=["emd", "emd+lmd"])
-        ap.add_argument("--sigma_data", type=float, default=0.5)
+        ap.add_argument("--latent-dim", type=int, default=32)
+        ap.add_argument("--teacher-steps", type=int, default=None)
+        ap.add_argument("--student-steps", type=int, default=None)
+        ap.add_argument("--train-mode", default="emd", choices=["emd", "emd+lmd"])
+        ap.add_argument("--base-std", type=float, default=1.0)
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
         cfg = Config(
             dataset=args.dataset,
             latent_dim=args.latent_dim,
-            sigma_data=args.sigma_data,
+            base_std=args.base_std,
             train_mode=args.train_mode,
             seed=args.seed,
             out=args.out or f"results/gaussian_rf_{args.dataset}.png",

@@ -10,7 +10,7 @@ Decoder uses nearest-neighbour upsample + conv instead of ConvTranspose2d to
 avoid checkerboard artefacts (Odena et al., 2016).
 
 Latent vectors are bounded in (-1, 1)^latent_dim by the encoder tanh, compatible
-with the Uniform[-1,1]^d noise prior used by the bounded RF arm.
+with the Uniform[-1,1]^d noise prior used by the Uniform RF arm.
 
 Public API
 ----------

@@ -1,11 +1,12 @@
 [project]
 name = "uniflow"
 version = "0.1.0"
-description = "Toy benchmark for Gaussian versus bounded-uniform rectified-flow distillation"
+description = "Toy benchmark for Gaussian versus Uniform RF distillation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "matplotlib>=3.5",
+    "POT>=0.9.6",
     "torch>=2.0",
 ]
 

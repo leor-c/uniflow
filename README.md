@@ -1,21 +1,30 @@
 # UniFlow
 
-UniFlow is a small research benchmark for one question: **does matching a
-uniform base distribution to tanh-bounded latents improve rectified flow (RF)
-and its few-step distillation compared with the usual Gaussian setup?**
+Diffusion and flow models predominantly use Gaussian noise, which requires rescaling the latents to match its fixed unit scale.
+
+This repo studies an alternative: uniform noise on [-1, 1] paired with tanh-bounded latents (a tanh applied to the encoder output). The supports coincide by construction, so there's nothing to rescale, and the bounded space can be enforced at generation time.
+
+The study uses 1-Rectified Flow (RF) and compares the standard Gaussian noise baseline against the uniform noise variant, with an EDM baseline included for reference. It also evaluates Align Your Flow (AYF) distillation, training an AYF student for each baseline.
+
+---
 
 The repository compares three matched toy pipelines:
 
 | Arm | Data latent | Base distribution | Learned models |
 |---|---|---|---|
-| Gaussian RF | Unbounded encoder output | $\mathcal N(0, 0.5^2 I)$ | RF teacher + AYF student |
-| Bounded RF | $\tanh(E(x)) \in (-1,1)^d$ | $\mathcal U([-1,1]^d)$ | RF teacher + AYF student |
-| EDM | Unbounded encoder output | Gaussian perturbations | EDM teacher + AYF student |
+| Gaussian RF | Standardized unbounded encoder output | $\mathcal N(0,I)$ | RF teacher + AYF student |
+| Uniform RF | $\tanh(E(x)) \in (-1,1)^d$ | $\mathcal U([-1,1]^d)$ | RF teacher + AYF student |
+| EDM | Standardized unbounded encoder output | Gaussian perturbations | EDM teacher + AYF student |
 
 This is intentionally a controlled 2D benchmark. The autoencoder and network
-width/depth are matched across all arms. Gaussian RF and EDM use the same
-unbounded encoder; the bounded-RF intervention changes the prior and adds the
-encoder's final `tanh` together.
+width/depth are matched across all arms. Gaussian RF and EDM train the same
+unbounded autoencoder for reconstruction only, followed by a fixed post-training
+latent rescaling: the latents are centred and divided by a *single global
+scalar*, following latent-diffusion practice, so the transform is a similarity
+and the latent geometry reaches the generative model undistorted. Uniform RF
+adds the encoder's final `tanh` and a weak
+moment penalty (weight $10^{-3}$) that targets the mean and second moment of
+$\mathcal U([-1,1])$; its latents are not post-training standardized.
 
 ## Method
 
@@ -47,55 +56,51 @@ $$
 \right\|^2\right].
 $$
 
+Following AYF, the tangent is normalised by its own norm,
+$\mathrm{d}f/\mathrm{d}t \mapsto (\mathrm{d}f/\mathrm{d}t)/(\lVert
+\mathrm{d}f/\mathrm{d}t\rVert + 0.1)$, which bounds the influence of the rare
+large tangents that destabilise map distillation.
+
 At inference, the same map supports one-step generation with $C(z_0,0,1)$ or
-few-step generation by composing adjacent intervals. The EDM teacher retains
-its standard preconditioned denoising objective. Its AYF student uses normalized
-noise-to-data time and follows the EDM probability-flow velocity
+few-step generation by composing adjacent intervals.
+
+The EDM teacher retains its standard preconditioned denoising objective with the
+published Karras noise distribution and schedule. AYF distils diffusion teachers
+inside the flow-matching framework rather than in $\sigma$ space, so the trained
+denoiser is exposed as a flow-matching velocity field through the change of
+variables $\sigma(t)=(1-t)/t$:
 
 $$
-v_{\mathrm{EDM}}(z,t)
-= \frac{d\log\sigma(t)}{dt}\left[z-D_\phi(z,\sigma(t))\right].
+v(z_t,t)=\frac{D\!\left(z_t/t,\ \sigma(t)\right)-z_t}{1-t}.
 $$
 
-This gives all three students the same arbitrary-interval boundary
-$C_\theta(z,t,t)=z$ and the same deterministic interval-composition semantics.
+The shared AYF student, objective, interval schedule and samplers then drive it
+unchanged, so all three arms run the same algorithm with the same boundary
+$C_\theta(z,t,t)=z$ and differ only in their teacher and base distribution. The
+velocity stays $O(1)$ across the whole interval, unlike the preconditioned
+unit-scale state $y=z/\sqrt{\sigma^2+\sigma_{\mathrm{data}}^2}$ used
+previously, in which the true velocity collapses as
+$O((\sigma_{\mathrm{data}}/\sigma)^2)$ at the noise end while the teacher's
+denoiser error does not.
 
 ## Results
 
-> **Note:** The checked-in results below predate both the EDM encoder alignment
-> and the EDM AYF student. They were generated with tanh-bounded EDM latents and
-> an endpoint consistency student. The EDM row and figure must be regenerated
-> before comparing them with results from the current code.
-
 The default 8-Gaussians benchmark uses seeds 1–5, 32-dimensional latents, 20k
 AE steps, 10k teacher steps, 10k student steps, and batch size 64. Each seed
-evaluates 5,000 generated samples using sliced Wasserstein distance (SWD) in
-data space over 256 fixed random projections; lower is better. Results are the
-mean ± sample standard deviation across seeds. Figures use seed 1 as a
+generates 5,000 evaluation samples and evaluates 2,048 uniformly sampled points
+with three complementary density diagnostics: generated-sample NLL under the
+known target density (fidelity), held-out target NLL under a generated-sample
+KDE (coverage), and the fraction beyond a three-noise-scale tube around the
+clean modes or arcs. Results are the mean ± sample standard deviation across
+seeds; lower is better. Figures use seed 1 as a
 qualitative example and contain the target data, AE reconstruction, teacher ODE
 samples, and one- and eight-step students.
 
-<!-- BENCHMARK_RESULTS_START -->
-| Pipeline | Teacher | Student, 1 step | Student, 8 steps |
-|---|---:|---:|---:|
-| Gaussian RF + AYF | 0.075 ± 0.021 | 0.098 ± 0.013 | 0.094 ± 0.011 |
-| Bounded RF + AYF | 0.069 ± 0.010 | 0.087 ± 0.016 | 0.081 ± 0.020 |
-| EDM + consistency student | 0.074 ± 0.020 | 0.084 ± 0.013 | 0.114 ± 0.028 |
-<!-- BENCHMARK_RESULTS_END -->
-
-Bounded RF has the lowest observed mean teacher and eight-step SWD, while EDM
-has the lowest one-step mean. Compared with Gaussian RF, the bounded arm has
-lower observed means at all three reported outputs. Interval composition
-improves both RF students on average, while EDM refinement degrades its student.
-The standard deviations overlap, so these are descriptive five-seed results,
-not a significance test or a large-scale generative-model claim.
-
-### Aggregate comparison
-
-Bars show mean SWD, error bars show ± one sample standard deviation, and points
-show the five individual seed results.
-
-![Aggregate SWD comparison](results/summary_8gaussians.png)
+The previous SWD, exact-W2, and MMD tables were removed because a single
+symmetric average did not reflect the visible two-moons geometry. Run the
+benchmark to regenerate the release tables with separate fidelity and coverage
+values. Evaluation tensors are saved as ignored `.pt` files alongside the JSON
+metrics so future metric changes do not require retraining.
 
 ### Qualitative samples
 
@@ -105,9 +110,9 @@ The following panels are seed 1 examples from that archived benchmark run.
 
 ![Gaussian RF and AYF samples](results/gaussian_rf_8gaussians-seed-1.png)
 
-**Uniform noise + tanh-bounded RF + AYF**
+**Uniform RF + AYF (uniform noise + tanh latents)**
 
-![Bounded RF and AYF samples](results/bounded_rf_8gaussians-seed-1.png)
+![Uniform RF and AYF samples](results/uniform_rf_8gaussians-seed-1.png)
 
 **EDM**
 
@@ -161,11 +166,17 @@ For a quick pipeline check:
 python -m toy.run_all --seed 1 --ae_steps 10 --teacher_steps 10 --student_steps 10
 ```
 
+Set one shared autoencoder latent dimension across all three benchmark arms with:
+
+```bash
+python -m toy.run_all --latent_dim 8
+```
+
 Individual arms can be run with `python -m toy.gaussian_rf`,
-`python -m toy.bounded_rf`, or `python -m toy.edm_baseline`.
+`python -m toy.uniform_rf`, or `python -m toy.edm_baseline`.
 All generated figures and JSON metrics are written to `results/`.
 
-The `mnist/` directory contains optional bounded-RF/AYF and EDM extensions.
+The `mnist/` directory contains optional Uniform RF/AYF and EDM extensions.
 They are not part of the reported comparison and require `torchvision` plus a
 separate, substantially longer training run.
 
@@ -175,7 +186,7 @@ separate, substantially longer training run.
 core/rf/       shared RF teacher and ODE utilities
 core/ayf/      Gaussian-prior AYF objective and sampling
 core/ayf_rf/   uniform-prior, bounded-latent AYF objective and sampling
-core/edm/      EDM teacher, AYF student, and consistency reference
+core/edm/      EDM teacher, flow-matching wrapper, and consistency reference
 toy/           primary 2D benchmark and runner
 mnist/         optional image-space extension
 results/       generated figures and metric summaries

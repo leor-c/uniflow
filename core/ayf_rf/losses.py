@@ -24,6 +24,31 @@ from ..rf import RFTeacher, sample_uniform_noise
 from .models import RFIntervalFlowMap
 from .sampling import sample_ayf_time_pair, integrate_teacher_interval, integrate_teacher_to_data
 
+# Align Your Flow tangent-normalization constant.
+AYF_TANGENT_NORM_C = 0.1
+
+
+def normalize_tangent(
+    tangent: torch.Tensor,
+    c: float = AYF_TANGENT_NORM_C,
+) -> torch.Tensor:
+    """AYF tangent normalization, shared by every arm in this repo.
+
+        df/dt  ->  (df/dt) / (||df/dt|| + c),   c = 0.1
+
+    The norm is taken per sample over the whole tangent vector and detached, so
+    it rescales the residual without contributing a gradient of its own. The
+    resulting squared loss grows like ``r^2 / c^2`` for a small tangent norm
+    ``r`` and saturates at 1 for a large one, which is what bounds the
+    influence of the rare huge tangents that destabilise map distillation.
+
+    This replaces an earlier teacher-velocity normalization
+    ``sqrt(1 + mean(v^2))``, which scaled the residual by the magnitude of the
+    teacher velocity rather than by the tangent's own norm.
+    """
+    scale = tangent.detach().norm(dim=-1, keepdim=True)
+    return tangent / (scale + c)
+
 
 def ayf_emd_loss(
     student: RFIntervalFlowMap,
@@ -63,8 +88,7 @@ def ayf_emd_loss(
         tangents=(v, torch.ones_like(t)),
     )
 
-    norm = torch.sqrt(1.0 + v.pow(2).mean(dim=-1, keepdim=True)).detach()
-    residual = tangent / norm
+    residual = normalize_tangent(tangent)
     return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
@@ -102,8 +126,7 @@ def ayf_emd_ct_loss(
         tangents=(v, torch.ones_like(t)),
     )
 
-    norm = torch.sqrt(1.0 + v.pow(2).mean(dim=-1, keepdim=True)).detach()
-    residual = tangent / norm
+    residual = normalize_tangent(tangent)
     return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
@@ -145,8 +168,7 @@ def ayf_lmd_loss(
     with torch.no_grad():
         v_target = teacher(z_s_hat, s)
 
-    norm = torch.sqrt(1.0 + v_target.pow(2).mean(dim=-1, keepdim=True)).detach()
-    residual = (dC_ds - v_target) / norm
+    residual = normalize_tangent(dC_ds - v_target)
     return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
