@@ -41,8 +41,9 @@ class MNISTEncoder(nn.Module):
         → Flatten → Linear → tanh
     """
 
-    def __init__(self, latent_dim: int = 64):
+    def __init__(self, latent_dim: int = 64, bounded: bool = True):
         super().__init__()
+        self.bounded = bounded
         self.net = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=1, stride=1, padding=0),
             nn.SiLU(),
@@ -56,8 +57,10 @@ class MNISTEncoder(nn.Module):
         self.head = nn.Linear(128 * 7 * 7, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Raw encoder output; the tanh boundary applies only to bounded latents."""
         h = self.net(x).flatten(1)
-        return torch.tanh(self.head(h))
+        z = self.head(h)
+        return torch.tanh(z) if self.bounded else z
 
 
 class MNISTDecoder(nn.Module):
@@ -93,19 +96,52 @@ class MNISTDecoder(nn.Module):
 
 
 class MNISTAutoEncoder(nn.Module):
-    """Full MNIST AE. Encoder output is bounded in (-1, 1)^latent_dim."""
+    """Full MNIST AE, mirroring ``toy.common.ToyAE``.
 
-    def __init__(self, latent_dim: int = 64):
+    ``bounded=True`` gives tanh latents in ``(-1, 1)^d`` for the uniform arm.
+    ``bounded=False`` trains a plain reconstruction autoencoder whose latents are
+    then centred and divided by a single global scalar
+    (``fit_latent_normalization``), so the transform is a similarity and the
+    latent geometry reaches the generative model undistorted -- the Gaussian RF
+    and EDM arms both use that form.
+    """
+
+    def __init__(self, latent_dim: int = 64, bounded: bool = True):
         super().__init__()
-        self.encoder = MNISTEncoder(latent_dim)
+        self.encoder = MNISTEncoder(latent_dim, bounded=bounded)
         self.decoder = MNISTDecoder(latent_dim)
         self.latent_dim = latent_dim
+        self.bounded = bounded
+        self.register_buffer("latent_mean", torch.zeros(latent_dim))
+        self.register_buffer("latent_std", torch.ones(latent_dim))
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def raw_latent(self, x: torch.Tensor) -> torch.Tensor:
+        """Encoder output before standardization (already tanh'd if bounded)."""
         return self.encoder(x)
 
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.encoder(x)
+        if self.bounded:
+            return z
+        return (z - self.latent_mean) / self.latent_std
+
     def decode(self, z: torch.Tensor) -> torch.Tensor:
+        if not self.bounded:
+            z = z * self.latent_std + self.latent_mean
         return self.decoder(z)
+
+    @torch.no_grad()
+    def fit_latent_normalization(self, x: torch.Tensor) -> None:
+        """Centre, then rescale by one global scalar. See ToyAE for the rationale."""
+        if self.bounded:
+            raise ValueError("Bounded latents are not Gaussian-standardized")
+        raw = self.raw_latent(x)
+        mean = raw.mean(dim=0)
+        std = (raw - mean).std(correction=0)
+        if std <= 1e-6:
+            raise RuntimeError("Cannot standardize a collapsed latent space")
+        self.latent_mean.copy_(mean)
+        self.latent_std.fill_(std.item())
 
     def forward(self, x: torch.Tensor):
         z = self.encode(x)
@@ -148,7 +184,7 @@ distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
         recon = F.mse_loss(x_hat, x)
         loss = recon
 
-        if latent_spread_weight > 0:
+        if ae.bounded and latent_spread_weight > 0:
             mean_pen = z.mean(dim=0).pow(2).mean()
             var_pen  = (z.var(dim=0) - 1.0 / 3.0).pow(2).mean()
             loss = loss + latent_spread_weight * (mean_pen + var_pen)
@@ -160,6 +196,11 @@ distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
             print(f"[mnist ae] step {step:05d} | mse {recon.item():.4f}")
 
     ae.eval()
+    if not ae.bounded:
+        with torch.no_grad():
+            calibration, _ = next(_infinite(loader))
+            ae.fit_latent_normalization(calibration.to(device))
+        print(f"[mnist ae] latent global scale {ae.latent_std[0].item():.4f}")
 
 
 # ---------------------------------------------------------------------------

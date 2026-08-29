@@ -185,13 +185,24 @@ class EDMAYFStudentTests(unittest.TestCase):
     def test_emd_uses_ayf_tangent_normalisation(self):
         """
         AYF normalises the tangent by its own norm, df/dt / (||df/dt|| + 0.1),
-        rather than by the teacher-velocity scale.
+        rather than by the teacher-velocity scale, and takes the tangent under
+        stopgrad'd weights so it is a constant w.r.t. theta.
 
-        With C(z, t, s) = z + (s - t) a and a constant slope a, the source-time
-        JVP along (v, 1) is ``v - a``. For a one-dimensional latent and v = 2 at
-        a = 0 the tangent norm is 2, so
+        AYF Algorithm 1 line 10 puts the loss on the SLOPE F, not the full map
+        C = z + (s-t)F, so the gradient carries no interval-length factor.
 
-            loss = ((v - a) / 2.1)^2   and   dloss/da = -2 * (2 / 2.1) / 2.1.
+        With a constant slope a, dF/dt = 0, so at r=1 the tangent reduces to
+        ``g = a - v``. For a one-dimensional latent and v = 2 at a = 0 the norm
+        is 2, the normalised g is -2/2.1, and
+
+            dloss/da = 2 * (-2 / 2.1) * dF/da = -2 * (2 / 2.1).
+
+        There is deliberately no ``(s - t)`` factor here: applying the surrogate
+        to C instead of F reintroduces one, suppressing exactly the short
+        intervals whose tangent carries the flow-matching signal.
+
+        The sign matters: it is what makes descent move the slope *towards* the
+        teacher velocity rather than away from it.
         """
         student = _ConstantSlopeStudent()
         z = torch.zeros(2, 1)
@@ -211,8 +222,10 @@ class EDMAYFStudentTests(unittest.TestCase):
 
         loss.backward()
         torch.testing.assert_close(
-            student.value.grad, torch.tensor(-2.0 * (2.0 / 2.1) / 2.1),
+            student.value.grad, torch.tensor(-2.0 * (2.0 / 2.1)),
         )
+        # descent must move the slope toward the teacher velocity
+        self.assertLess(student.value.grad.item(), 0.0)
 
     def test_student_training_reads_the_shared_ayf_config_fields(self):
         cfg = EDMConfig(device="cpu")

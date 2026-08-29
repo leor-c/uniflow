@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..modules import FourierTimeEmbedding, FiLMMLP
+from ..modules import FourierTimeEmbedding, FiLMMLP, RandomFourierFeatures
 
 
 class EDMPrecondDenoiser(nn.Module):
@@ -29,11 +29,20 @@ class EDMPrecondDenoiser(nn.Module):
             sigma_data: float = 0.5,
             num_freq: int = 64,
             max_freq: float = 32.0,
+            ff_scale: float | None = None,
+            ff_size: int = 64,
     ):
         super().__init__()
         self.sigma_data = float(sigma_data)
         self.noise_embed = FourierTimeEmbedding(num_freq, max_freq)
-        self.mlp = FiLMMLP(latent_dim, self.noise_embed.dim, latent_dim, hidden=hidden, depth=depth)
+        # Features go on the PRECONDITIONED input c_in*z, which EDM keeps at
+        # unit scale for every sigma, so input_scale is 1 by construction.
+        self.state_features = (
+            RandomFourierFeatures(latent_dim, ff_size, ff_scale, 1.0)
+            if ff_scale is not None else None
+        )
+        in_dim = latent_dim if self.state_features is None else self.state_features.dim
+        self.mlp = FiLMMLP(in_dim, self.noise_embed.dim, latent_dim, hidden=hidden, depth=depth)
 
     def forward(self, z: torch.Tensor, log_sigma: torch.Tensor) -> torch.Tensor:
         if log_sigma.ndim == 1:
@@ -55,7 +64,9 @@ class EDMPrecondDenoiser(nn.Module):
         """
         if log_sigma.ndim == 1:
             log_sigma = log_sigma[:, None]
-        return self.mlp(scaled_input, self.noise_embed(0.25 * log_sigma))
+        h = (scaled_input if self.state_features is None
+             else self.state_features(scaled_input))
+        return self.mlp(h, self.noise_embed(0.25 * log_sigma))
 
     def _scalings(
             self, sigma: torch.Tensor,

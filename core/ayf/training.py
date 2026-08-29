@@ -7,7 +7,7 @@ AYF training loops.
 cfg fields for teacher:  batch_size, latent_dim, device, teacher_lr,
                          teacher_steps, base_std, log_every.
 cfg fields for student:  batch_size, latent_dim, device, student_lr,
-                         student_steps, base_std, emd_weight, lmd_weight,
+                         student_steps, base_std, train_mode, emd_weight, lmd_weight,
                          jvp_dt_ref, time_eps, eval_teacher_ode_steps, log_every.
 """
 
@@ -18,6 +18,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from ..ayf_rf.training import resolve_train_mode
 from ..rf.models import RFTeacher
 from ..ayf_rf.models import RFIntervalFlowMap
 from .sampling import sample_noise
@@ -65,21 +66,35 @@ def train_student_ayf(
 ) -> None:
     student.train()
     teacher.eval()
+    terms = resolve_train_mode(cfg)
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.student_lr)
 
-    for step in range(1, cfg.student_steps + 1):
-        loss_emd = ayf_emd_loss(
-            student, teacher, latent_sampler,
-            cfg.batch_size, cfg.latent_dim, cfg.device,
-            base_std=cfg.base_std,
-            jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
-            interval_p_mean=cfg.interval_p_mean,
-            interval_p_std=cfg.interval_p_std,
-        )
-        loss = cfg.emd_weight * loss_emd
+    warmup_steps = getattr(cfg, "tangent_warmup_steps", 0)
+    warmup_max = getattr(cfg, "tangent_warmup_max", 0.99)
 
+    for step in range(1, cfg.student_steps + 1):
+        # AYF Algorithm 1 line 7: r = min(r_max, Iters / H). r scales only the
+        # (s-t)dF/dt term, so training starts as flow matching and eases the
+        # map-consistency term in. warmup_steps = 0 disables it (r = 1).
+        r = (1.0 if warmup_steps <= 0
+             else min(warmup_max, (step - 1) / float(warmup_steps)))
+        loss = torch.zeros((), device=cfg.device)
+        loss_emd = None
         loss_lmd = None
-        if cfg.lmd_weight > 0.0:
+
+        if "emd" in terms:
+            loss_emd = ayf_emd_loss(
+                student, teacher, latent_sampler,
+                cfg.batch_size, cfg.latent_dim, cfg.device,
+                base_std=cfg.base_std,
+                jvp_dt_ref=cfg.jvp_dt_ref, time_eps=cfg.time_eps,
+                interval_p_mean=cfg.interval_p_mean,
+                interval_p_std=cfg.interval_p_std,
+                tangent_warmup=r,
+            )
+            loss = loss + cfg.emd_weight * loss_emd
+
+        if "lmd" in terms:
             loss_lmd = ayf_lmd_loss(
                 student, teacher, latent_sampler,
                 cfg.batch_size, cfg.latent_dim, cfg.device,
@@ -114,10 +129,12 @@ def train_student_ayf(
             ).item()
 
             msg = (
-                f"[AYF] step {step:05d} | "
-                f"loss {loss.item():.6f} | emd {loss_emd.item():.6f} | "
+                f"[AYF {cfg.train_mode}] step {step:05d} | "
+                f"loss {loss.item():.6f} | "
                 f"eval endpoint {ep:.6f} | eval interval {itv:.6f}"
             )
+            if loss_emd is not None:
+                msg += f" | emd {loss_emd.item():.6f}"
             if loss_lmd is not None:
                 msg += f" | lmd {loss_lmd.item():.6f}"
             print(msg)

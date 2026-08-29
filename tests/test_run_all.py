@@ -47,6 +47,7 @@ class RunAllAggregationTests(unittest.TestCase):
             ae_steps=None,
             teacher_steps=None,
             student_steps=None,
+            train_mode=None,
         )
 
         result = _apply_overrides(
@@ -60,6 +61,34 @@ class RunAllAggregationTests(unittest.TestCase):
         self.assertIs(result, cfg)
         self.assertEqual(cfg.latent_dim, 8)
         self.assertEqual(cfg.seed, 3)
+
+    def test_train_mode_override_reaches_every_arm(self):
+        """--train-mode must apply to all arms, and default to each Config's own."""
+        from toy.run_all import PIPELINE_MODULES, PIPELINES
+
+        def resolve(mode):
+            args = Namespace(dataset=None, latent_dim=None, ae_steps=None,
+                             teacher_steps=None, student_steps=None, train_mode=mode)
+            out = {}
+            for pipeline in PIPELINES:
+                module, teacher_field, student_field = PIPELINE_MODULES[pipeline]
+                cfg = _apply_overrides(
+                    module.Config(device="cpu"), args, seed=1,
+                    teacher_field=teacher_field, student_field=student_field,
+                )
+                out[pipeline] = cfg.train_mode
+            return out
+
+        self.assertEqual(set(resolve("lmd").values()), {"lmd"})
+        self.assertEqual(set(resolve("emd+lmd").values()), {"emd+lmd"})
+        # omitted -> each arm keeps its own default rather than being forced
+        self.assertEqual(resolve(None), {p: "emd" for p in PIPELINES})
+
+    def test_every_pipeline_has_a_module_and_label(self):
+        from toy.run_all import PIPELINE_LABELS, PIPELINE_MODULES, PIPELINES
+
+        self.assertEqual(set(PIPELINE_MODULES), set(PIPELINES))
+        self.assertEqual(set(PIPELINE_LABELS), set(PIPELINES))
 
     def test_cuda_parallelizes_all_pending_seeds_by_default(self):
         self.assertEqual(_worker_count(True, pending_seeds=5, requested=None), 5)

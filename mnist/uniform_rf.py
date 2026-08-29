@@ -66,13 +66,39 @@ class Config:
     student_lr: float = 1e-3
     student_steps: int = 20000
 
-    train_mode: str = "emd"   # "emd" (teacher-based) | "ct" (teacher-free)
+    # '+'-joined AYF terms: "emd" | "ct" | "lmd", e.g. "emd+lmd".
+    train_mode: str = "emd"
     emd_weight: float = 1.0
-    lmd_weight: float = 0.0
+    lmd_weight: float = 1.0
     pairwise_anchor_weight: float = 0.0
     teacher_interval_anchor_weight: float = 0.0
 
     jvp_dt_ref: float = 0.02
+    # Shared AYF Algorithm 1 interval schedule, same values as every toy arm.
+    # train_student_interval has read these since the schedule was unified in
+    # core; without them the student loop raises AttributeError on step 1.
+    interval_p_mean: float = -0.6
+    interval_p_std: float = 1.6
+
+    # AYF Algorithm 1 line 7: tangent warmup r = min(r_max, Iters / H). r scales
+    # only the (s-t)dF/dt term, so training begins as flow matching and eases
+    # the map-consistency term in. The paper uses H = 10k with far longer runs;
+    # set 0 to disable (r = 1 from step one, which is what we ran before).
+    tangent_warmup_steps: int = 2000
+    tangent_warmup_max: float = 0.99
+
+
+    # --- Fourier features (off for MNIST) ------------------------------------
+    # The spectral-bias argument these address concerns LOW-dimensional
+    # coordinate inputs; the toy arms enable them at latent_dim=2, where a plain
+    # MLP cannot represent the near-discontinuous velocity between modes. At
+    # this arm's latent_dim they are untested, so they are reachable but off.
+    # The toy scales were tuned at latent_dim=2 on 8-Gaussians and do not
+    # transfer -- at latent_dim=8 they measurably hurt the teacher.
+    ff_size: int = 64
+    teacher_ff_scale: float | None = None
+    student_ff_scale: float | None = None
+    ff_input_scale: float = 1.0
     time_eps: float = 1e-4
 
     interval_teacher_ode_steps: int = 16
@@ -86,7 +112,7 @@ class Config:
     sample_clamp: bool = False
 
     log_every: int = 100
-    out_dir: str = "runs/mnist_ayf_rf"
+    out_dir: str = "results/mnist/uniform_rf"
 
 
 def fast_cpu_config(**overrides) -> Config:
@@ -179,8 +205,12 @@ def main(cfg: Config | None = None):
         ap.add_argument("--ae_steps", type=int, default=None)
         ap.add_argument("--teacher_steps", type=int, default=None)
         ap.add_argument("--student_steps", type=int, default=None)
-        ap.add_argument("--train_mode", default="emd", choices=["emd", "ct"])
-        ap.add_argument("--out_dir", default="runs/mnist_ayf_rf")
+        ap.add_argument(
+            "--train_mode", default="emd",
+            choices=["emd", "lmd", "emd+lmd", "ct", "ct+lmd"],
+        )
+        ap.add_argument("--lmd_weight", type=float, default=None)
+        ap.add_argument("--out_dir", default="results/mnist/uniform_rf")
         ap.add_argument("--data_root", default="./data")
         args = ap.parse_args()
         cfg = fast_cpu_config() if args.fast else Config()
@@ -193,6 +223,8 @@ def main(cfg: Config | None = None):
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
         cfg.train_mode = args.train_mode
+        if args.lmd_weight is not None:
+            cfg.lmd_weight = args.lmd_weight
         cfg.out_dir = args.out_dir
         cfg.data_root = args.data_root
 
@@ -206,7 +238,7 @@ def main(cfg: Config | None = None):
     )
 
     # --- AE ---
-    ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim).to(cfg.device)
+    ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim, bounded=True).to(cfg.device)
     print("\nTraining MNIST autoencoder...")
     train_mnist_ae(
         ae, train_loader,
@@ -229,13 +261,21 @@ def main(cfg: Config | None = None):
     latent_sampler = make_mnist_latent_sampler(all_latents, cfg.device)
 
     # --- RF teacher ---
-    teacher = R.RFTeacher(cfg.latent_dim, cfg.hidden, cfg.depth).to(cfg.device)
+    teacher = R.RFTeacher(
+        cfg.latent_dim, cfg.hidden, cfg.depth,
+        ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
+        ff_input_scale=cfg.ff_input_scale,
+    ).to(cfg.device)
     print("\nTraining RF teacher in latent space...")
     R.train_teacher(teacher, latent_sampler, cfg)
     torch.save(teacher.state_dict(), os.path.join(cfg.out_dir, "teacher.pt"))
 
     # --- AYF interval student ---
-    student = A.RFIntervalFlowMap(cfg.latent_dim, cfg.hidden, cfg.depth).to(cfg.device)
+    student = A.RFIntervalFlowMap(
+        cfg.latent_dim, cfg.hidden, cfg.depth,
+        ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
+        ff_input_scale=cfg.ff_input_scale,
+    ).to(cfg.device)
     print(f"\nTraining AYF interval flow map ({cfg.train_mode})...")
     A.train_student_interval(student, teacher, latent_sampler, cfg)
     torch.save(student.state_dict(), os.path.join(cfg.out_dir, "student.pt"))

@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from core.modules import MLP
+from core.modules import MLP, RandomFourierFeatures
 from toy.datasets import get_sampler
 
 DENSITY_SAMPLES = 2048
@@ -57,16 +57,29 @@ class ToyAE(nn.Module):
         hidden: int = 128,
         depth: int = 2,
         bounded: bool = True,
+        ff_scale: float | None = None,
+        ff_size: int = 64,
     ):
         super().__init__()
-        self.encoder_net = MLP(2, latent_dim, hidden=hidden, depth=depth)
+        # Optional Fourier encoding of the 2D input. Identical across arms,
+        # so one scale is automatically comparable between them.
+        self.input_features = (
+            RandomFourierFeatures(2, ff_size, ff_scale) if ff_scale is not None else None
+        )
+        encoder_in = 2 if self.input_features is None else self.input_features.dim
+        self.encoder_net = MLP(encoder_in, latent_dim, hidden=hidden, depth=depth)
         self.decoder_net = MLP(latent_dim, 2, hidden=hidden, depth=depth)
         self.bounded = bounded
         self.register_buffer("latent_mean", torch.zeros(latent_dim))
         self.register_buffer("latent_std", torch.ones(latent_dim))
 
+    def raw_latent(self, x: torch.Tensor) -> torch.Tensor:
+        """Encoder output before tanh / standardization."""
+        features = x if self.input_features is None else self.input_features(x)
+        return self.encoder_net(features)
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encoder_net(x)
+        z = self.raw_latent(x)
         if self.bounded:
             return torch.tanh(z)
         return (z - self.latent_mean) / self.latent_std
@@ -96,7 +109,7 @@ class ToyAE(nn.Module):
         """
         if self.bounded:
             raise ValueError("Bounded latents are not Gaussian-standardized")
-        raw_latents = self.encoder_net(x)
+        raw_latents = self.raw_latent(x)
         latent_mean = raw_latents.mean(dim=0)
         # Measure the scale after centring, so the normalized latents really do
         # have unit overall standard deviation and match the base distribution.
@@ -347,6 +360,31 @@ def evaluate_density_outputs(
             dataset, generated
         )
     return metrics
+
+
+# Fields that determine a result. Recorded alongside the metrics so a saved
+# number can be traced back to the configuration that produced it -- without
+# this, latent_dim / train_mode / the Fourier scales are unrecoverable from the
+# artifacts alone.
+RUN_CONFIG_FIELDS = (
+    "dataset", "seed", "latent_dim", "hidden", "depth", "ae_depth",
+    "ae_steps", "teacher_steps", "edm_teacher_steps", "student_steps",
+    "batch_size", "train_mode", "emd_weight", "lmd_weight",
+    "jvp_dt_ref", "time_eps", "interval_p_mean", "interval_p_std",
+    "tangent_warmup_steps", "tangent_warmup_max",
+    "ff_size", "ae_ff_scale", "teacher_ff_scale", "student_ff_scale",
+    "ff_input_scale", "latent_reg_weight", "base_std",
+    "sigma_data", "sigma_min", "sigma_max", "edm_rho", "edm_p_mean", "edm_p_std",
+)
+
+
+def run_config_record(cfg) -> dict:
+    """The subset of ``cfg`` that determines the result, for the metrics file."""
+    return {
+        field: getattr(cfg, field)
+        for field in RUN_CONFIG_FIELDS
+        if hasattr(cfg, field)
+    }
 
 
 def save_evaluation_samples(

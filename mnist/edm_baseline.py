@@ -57,24 +57,55 @@ class Config:
     edm_teacher_lr: float = 1e-3
 
     # EDM noise
-    sigma_data: float = 0.5
-    sigma_min: float = 0.002
-    sigma_max: float = 5.0
+    # Must match the latent scale the AE actually produces. This arm uses the
+    # unbounded autoencoder, whose latents are rescaled to unit global scale by
+    # fit_latent_normalization, so sigma_data is 1.0 -- the 0.5 that suited the
+    # old bounded tanh latents mis-calibrates every EDM preconditioning term.
+    sigma_data: float = 1.0
+    # Exact 2x scaling of the previous sigma_data=0.5 configuration, so every
+    # ratio to sigma_data is unchanged: sigma_max/sigma_data stays 10 (large
+    # enough for N(0, sigma_max^2) to stand in for p_sigma_max) and sigma_max
+    # stays 2.34 sd above the teacher's log-sigma mean, i.e. inside the range it
+    # actually trains on. Losing that property is what broke the toy EDM arm.
+    sigma_min: float = 0.004
+    sigma_max: float = 10.0
     edm_rho: float = 7.0
-    edm_p_mean: float = -1.2
+    edm_p_mean: float = -1.2 + math.log(2.0)
     edm_p_std: float = 1.2
 
     # AYF student. The teacher is wrapped as a flow-matching velocity field,
     # so these are the shared AYF field names read by core.ayf.
     student_steps: int = 20000
     student_lr: float = 1e-3
-    train_mode: str = "emd"  # "emd" | "emd+lmd"
+    # '+'-joined AYF terms: "emd" | "lmd" | "emd+lmd".
+    train_mode: str = "emd"
     emd_weight: float = 1.0
-    lmd_weight: float = 0.0
+    lmd_weight: float = 1.0
     jvp_dt_ref: float = 1.0
     time_eps: float = 1e-4
     interval_p_mean: float = -0.6
     interval_p_std: float = 1.6
+
+    # AYF Algorithm 1 line 7: tangent warmup r = min(r_max, Iters / H). r scales
+    # only the (s-t)dF/dt term, so training begins as flow matching and eases
+    # the map-consistency term in. The paper uses H = 10k with far longer runs;
+    # set 0 to disable (r = 1 from step one, which is what we ran before).
+    tangent_warmup_steps: int = 2000
+    tangent_warmup_max: float = 0.99
+
+
+    # --- Fourier features (off for MNIST) ------------------------------------
+    # The spectral-bias argument these address is about LOW-dimensional
+    # coordinate inputs; the toy arms enable them at latent_dim=2, where a plain
+    # MLP cannot represent the near-discontinuous velocity between modes. At
+    # this arm's latent_dim they are untested and unmotivated, so they are
+    # exposed but disabled. The scales in toy/ were tuned at latent_dim=2 on
+    # 8-Gaussians and should not be assumed to transfer.
+    ff_size: int = 64
+    teacher_ff_scale: float | None = None
+    student_ff_scale: float | None = None
+    ff_input_scale: float = 1.0
+
     eval_teacher_ode_steps: int = 32
     # Base distribution of the flow-matching interpolant.
     base_std: float = 1.0
@@ -85,7 +116,7 @@ class Config:
     edm_student_sample_k: int = 8
 
     log_every: int = 1000
-    out_dir: str = "runs/mnist_edm_ayf"
+    out_dir: str = "results/mnist/edm_ayf"
 
 
 def fast_cpu_config(**overrides) -> Config:
@@ -189,7 +220,8 @@ def main(cfg: Config | None = None):
             default="emd",
             choices=["emd", "lmd", "emd+lmd"],
         )
-        ap.add_argument("--out_dir", default="runs/mnist_edm_ayf")
+        ap.add_argument("--lmd_weight", type=float, default=None)
+        ap.add_argument("--out_dir", default="results/mnist/edm_ayf")
         ap.add_argument("--data_root", default="./data")
         args = ap.parse_args()
         cfg = fast_cpu_config() if args.fast else Config()
@@ -202,6 +234,8 @@ def main(cfg: Config | None = None):
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
         cfg.train_mode = args.student_mode
+        if args.lmd_weight is not None:
+            cfg.lmd_weight = args.lmd_weight
         cfg.out_dir = args.out_dir
         cfg.data_root = args.data_root
 
@@ -215,7 +249,7 @@ def main(cfg: Config | None = None):
     )
 
     # --- AE ---
-    ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim).to(cfg.device)
+    ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim, bounded=False).to(cfg.device)
     print("\nTraining MNIST autoencoder...")
     train_mnist_ae(
         ae, train_loader,
@@ -242,6 +276,7 @@ def main(cfg: Config | None = None):
     # --- EDM teacher ---
     teacher = E.EDMPrecondDenoiser(
         cfg.latent_dim, cfg.hidden, cfg.depth, cfg.sigma_data,
+        ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
     ).to(cfg.device)
     print("\nTraining EDM teacher in latent space...")
     E.train_edm_teacher(teacher, latent_sampler, cfg)
@@ -255,6 +290,8 @@ def main(cfg: Config | None = None):
     ).to(cfg.device)
     student = A.RFIntervalFlowMap(
         cfg.latent_dim, cfg.hidden, cfg.depth,
+        ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
+        ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
     print(f"\nTraining EDM + AYF student ({cfg.train_mode})...")
     A.train_student_ayf(student, flow_teacher, latent_sampler, cfg)

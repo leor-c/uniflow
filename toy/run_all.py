@@ -42,6 +42,12 @@ PIPELINE_LABELS = {
     "gaussian_rf": "Gaussian RF + AYF",
     "edm_ayf": "EDM + AYF",
 }
+# result key -> (module, teacher-steps field, student-steps field)
+PIPELINE_MODULES = {
+    "uniform_rf": (uniform_rf, "teacher_steps", "student_steps"),
+    "gaussian_rf": (gaussian_rf, "teacher_steps", "student_steps"),
+    "edm_ayf": (edm_baseline, "edm_teacher_steps", "student_steps"),
+}
 OUTPUT_PREFIXES = (
     "ae_reconstruction",
     "teacher",
@@ -71,6 +77,8 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
     cfg.seed = seed
     if args.latent_dim is not None:
         cfg.latent_dim = args.latent_dim
+    if args.train_mode is not None:
+        cfg.train_mode = args.train_mode
     if args.ae_steps is not None:
         cfg.ae_steps = args.ae_steps
     if args.teacher_steps is not None:
@@ -121,45 +129,20 @@ def _load_seed_metrics(dataset: str, seed: int):
 
 
 def _run_seed(args, seed: int, *, multi_seed: bool):
-    dataset = args.dataset or "8gaussians"
-    print("\n" + "=" * 60)
-    print(f"Running seed {seed}: toy.uniform_rf")
-    print("=" * 60)
-    cfg = _apply_overrides(
-        uniform_rf.Config(), args, seed,
-        teacher_field="teacher_steps", student_field="student_steps",
-    )
-    if multi_seed or args.plot_all_seeds:
-        _configure_multi_seed_outputs(cfg, "uniform_rf", seed, args)
-    uniform_metrics = uniform_rf.main(cfg)
-
-    print("\n" + "=" * 60)
-    print(f"Running seed {seed}: toy.gaussian_rf")
-    print("=" * 60)
-    cfg = _apply_overrides(
-        gaussian_rf.Config(), args, seed,
-        teacher_field="teacher_steps", student_field="student_steps",
-    )
-    if multi_seed or args.plot_all_seeds:
-        _configure_multi_seed_outputs(cfg, "gaussian_rf", seed, args)
-    gaussian_metrics = gaussian_rf.main(cfg)
-
-    print("\n" + "=" * 60)
-    print(f"Running seed {seed}: toy.edm_baseline")
-    print("=" * 60)
-    cfg = _apply_overrides(
-        edm_baseline.Config(), args, seed,
-        teacher_field="edm_teacher_steps", student_field="student_steps",
-    )
-    if multi_seed or args.plot_all_seeds:
-        _configure_multi_seed_outputs(cfg, "edm_ayf", seed, args)
-    edm_metrics = edm_baseline.main(cfg)
-
-    return {
-        "uniform_rf": uniform_metrics,
-        "gaussian_rf": gaussian_metrics,
-        "edm_ayf": edm_metrics,
-    }
+    metrics = {}
+    for pipeline in PIPELINES:
+        module, teacher_field, student_field = PIPELINE_MODULES[pipeline]
+        print("\n" + "=" * 60)
+        print(f"Running seed {seed}: toy.{module.__name__.rsplit('.', 1)[-1]}")
+        print("=" * 60)
+        cfg = _apply_overrides(
+            module.Config(), args, seed,
+            teacher_field=teacher_field, student_field=student_field,
+        )
+        if multi_seed or args.plot_all_seeds:
+            _configure_multi_seed_outputs(cfg, pipeline, seed, args)
+        metrics[pipeline] = module.main(cfg)
+    return metrics
 
 
 def _aggregate(all_metrics: dict[int, dict]) -> dict:
@@ -435,6 +418,12 @@ def main():
                     help="Concurrent seed processes on CUDA (default: all seeds).")
     ap.add_argument("--latent-dim", type=int, default=None,
                     help="Shared autoencoder latent dimension for all pipelines.")
+    ap.add_argument(
+        "--train-mode", default=None, choices=["emd", "lmd", "emd+lmd"],
+        help="AYF objective applied to every arm, same grammar as the "
+             "individual arms. Omit to keep each arm's Config default. "
+             "('ct' is uniform-only; use python -m toy.uniform_rf for it.)",
+    )
     ap.add_argument("--ae-steps", type=int, default=None)
     ap.add_argument("--teacher-steps", type=int, default=None)
     ap.add_argument("--student-steps", type=int, default=None)

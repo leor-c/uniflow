@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..modules import FiLMMLP, FourierTimeEmbedding
+from ..modules import FiLMMLP, FourierTimeEmbedding, RandomFourierFeatures
 
 
 class RFTeacher(nn.Module):
@@ -18,11 +18,21 @@ class RFTeacher(nn.Module):
         depth: int = 4,
         num_freq: int = 64,
         max_freq: float = 32.0,
+        ff_scale: float | None = None,
+        ff_size: int = 64,
+        ff_input_scale: float = 1.0,
     ):
         super().__init__()
         self.time_embed = FourierTimeEmbedding(num_freq, max_freq, log_scale=False)
+        # Optional Fourier encoding of the state. Off by default; see
+        # RandomFourierFeatures for why it matters at low latent_dim.
+        self.state_features = (
+            RandomFourierFeatures(latent_dim, ff_size, ff_scale, ff_input_scale)
+            if ff_scale is not None else None
+        )
+        in_dim = latent_dim if self.state_features is None else self.state_features.dim
         self.mlp = FiLMMLP(
-            latent_dim,
+            in_dim,
             self.time_embed.dim,
             latent_dim,
             hidden=hidden,
@@ -32,4 +42,5 @@ class RFTeacher(nn.Module):
     def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if t.ndim == 1:
             t = t[:, None]
-        return self.mlp(z, self.time_embed(t))
+        h = z if self.state_features is None else self.state_features(z)
+        return self.mlp(h, self.time_embed(t))

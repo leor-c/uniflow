@@ -2,7 +2,7 @@
 AYF-style interval flow map losses (differentiable, return scalar unless noted):
     ayf_emd_loss                   – teacher-based source-time JVP (EMD)
     ayf_emd_ct_loss                – teacher-free EMD analog, v = z1 - z0
-    ayf_lmd_loss                   – teacher-based target-time JVP (LMD)
+    ayf_lmd_loss                   – target-time JVP (Boffi et al. LMD, not AYF-LMD)
     ayf_pairwise_anchor_loss       – cheap chord-interval supervised anchor
     ayf_teacher_interval_anchor_loss – teacher ODE interval supervised anchor
     ayf_endpoint_eval_loss         – (no_grad) C(z,t,1) vs teacher ODE to t=1
@@ -61,6 +61,7 @@ def ayf_emd_loss(
     time_eps: float = 1e-4,
     interval_p_mean: float = -0.6,
     interval_p_std: float = 1.6,
+    tangent_warmup: float = 1.0,
 ) -> torch.Tensor:
     """
     Teacher-based Eulerian/source-time map distillation (EMD):
@@ -81,14 +82,24 @@ def ayf_emd_loss(
 
     with torch.no_grad():
         v = teacher(zt, t)
+        # AYF Algorithm 1, lines 6-9. The tangent is built from the SLOPE net
+        # under stopgrad'd weights, and the warmup r multiplies only the
+        # (s-t)*dF/dt term -- so r=0 is pure flow matching (drive F onto the
+        # teacher velocity) and r=1 is the full map-consistency tangent.
+        slope_sg, dF_dt = jvp(
+            lambda z_in, t_in: student.slope(z_in, t_in, s),
+            primals=(zt, t),
+            tangents=(v, torch.ones_like(t)),
+        )
+        g = (slope_sg - v) - tangent_warmup * (s - t) * dF_dt
+        g = normalize_tangent(g)
 
-    _, tangent = jvp(
-        lambda z_in, t_in: student(z_in, t_in, s),
-        primals=(zt, t),
-        tangents=(v, torch.ones_like(t)),
-    )
-
-    residual = normalize_tangent(tangent)
+    # Algorithm 1 line 10: the loss is on the slope F_theta, not the full map
+    # C_theta = z + (s-t)F. Using C multiplies the gradient by (s-t), which
+    # suppresses exactly the short intervals whose tangent carries the
+    # well-constrained flow-matching signal.
+    slope = student.slope(zt, t, s)
+    residual = slope - slope_sg + g
     return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
@@ -120,13 +131,22 @@ def ayf_emd_ct_loss(
     zt = (1.0 - t) * z0 + t * z1
     v = z1 - z0
 
-    _, tangent = jvp(
-        lambda z_in, t_in: student(z_in, t_in, s),
-        primals=(zt, t),
-        tangents=(v, torch.ones_like(t)),
-    )
+    with torch.no_grad():
+        # Tangent under stopgrad'd weights, as in ayf_emd_loss.
+        _, tangent = jvp(
+            lambda z_in, t_in: student(z_in, t_in, s),
+            primals=(zt, t),
+            tangents=(v, torch.ones_like(t)),
+        )
 
-    residual = normalize_tangent(tangent)
+    target_step = normalize_tangent(tangent)
+    prediction = student(zt, t, s)
+    # Paper target: f_theta-(x_t', t', s) ~= f + eps(s-t) * tangent, stopgrad'd.
+    # The residual is therefore -tangent, so descent moves the map *along* the
+    # teacher trajectory. Using +tangent gives the same loss value with the
+    # gradient reversed, which drives the slope away from the teacher velocity.
+    target = (prediction + target_step).detach()
+    residual = prediction - target
     return (jvp_dt_ref ** 2) * residual.pow(2).mean()
 
 
@@ -143,12 +163,29 @@ def ayf_lmd_loss(
     interval_p_std: float = 1.6,
 ) -> torch.Tensor:
     """
-    Teacher-based target-time/Lagrangian map distillation (LMD):
+    Target-time/Lagrangian map distillation.
 
         || partial_s C(z,t,s) - v_phi(C(z,t,s), s) ||^2
 
-    Asks the predicted target state to move according to the teacher
-    velocity as the target time s changes.
+    NOTE: this is the LMD loss of Boffi et al., not AYF-LMD. Align Your Flow's
+    Theorem 3.3 defines AYF-LMD with a stopgrad target,
+
+        || f_theta(x_t,t,s) - ODE_{s'->s}(f_theta-(x_t,t,s')) ||^2,
+
+    and states that "by removing the stop-gradient operation ... and allowing
+    gradients to flow through both terms, we recover the LMD loss from Boffi et
+    al." Here the JVP carries gradient and only the teacher velocity is
+    detached, so this is the Boffi form with a partial stopgrad.
+
+    That is a deliberate, documented gap rather than a bug. The paper reports
+    the Boffi form "was already stable in practice and did not introduce
+    training instabilities" and that "both versions performed similarly",
+    recommending AYF-LMD for training *efficiency* (it avoids backpropagating
+    through the JVP), not for quality.
+
+    This also explains why EMD and LMD behaved so differently here before the
+    EMD stopgrad was added: the paper says EMD needs the stopgrad and LMD does
+    not, and this codebase originally lacked it in both.
     """
     with torch.no_grad():
         z1 = latent_sampler(batch_size)

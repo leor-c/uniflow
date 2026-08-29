@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass, field
 
 import torch
@@ -23,6 +24,7 @@ from toy.common import (
     make_data_sampler,
     make_latent_sampler,
     save_benchmark_figure,
+    run_config_record,
     save_metrics,
     save_evaluation_samples,
     train_toy_ae,
@@ -40,12 +42,38 @@ class Config:
     seed: int = 1
 
     # AE
-    latent_dim: int = 32
+    # The 2D benchmark is dimension-preserving at latent_dim=2: the latent is
+    # full-dimensional, so the bounded/uniform arm's supports genuinely
+    # coincide. Larger values are an expansion, where a 2D manifold sits in a
+    # much bigger space and the extra directions absorb student error.
+    latent_dim: int = 2
     hidden: int = 128
     ae_depth: int = 2
     ae_steps: int = 20000
     ae_lr: float = 1e-3
-    latent_reg_weight: float = 1e-3
+    # Off by default: at latent_dim=2 the moment penalty is unnecessary (it
+    # changes 1-step NLL by less than the seed spread). It is NOT optional at
+    # large latent_dim -- without it the encoder collapses coordinates and the
+    # teacher itself fails, so raise it if you increase latent_dim.
+    latent_reg_weight: float = 0.0
+
+    # --- Fourier features (off by default) -----------------------------------
+    # Random Fourier encodings of the coordinate inputs. A plain MLP on a
+    # low-dimensional input cannot represent the near-discontinuous velocity at
+    # the basin boundaries between modes, which strands mass between them; this
+    # matters at small latent_dim and is inert at large. Each site is
+    # independent: encoder input, teacher state, student state.
+    # Scales are divided by ``ff_input_scale`` below, so one nominal value means
+    # the same effective frequency in every arm.
+    ff_size: int = 64
+    # Kept identical to the other arms: the encoder input is the same 2D data
+    # everywhere, so an arm-specific scale would make the comparison uncontrolled.
+    ae_ff_scale: float | None = 0.5 * math.sqrt(2.0)
+    teacher_ff_scale: float | None = math.sqrt(2.0 / 3.0)
+    student_ff_scale: float | None = math.sqrt(2.0 / 3.0)
+    # Bounded latents satisfy E[z^2] = 1/3, so their scale is sqrt(1/3).
+    ff_input_scale: float = math.sqrt(1.0 / 3.0)
+
 
     # RF teacher
     depth: int = 4
@@ -56,9 +84,12 @@ class Config:
     student_lr: float = 1e-3
     student_steps: int = 10000
 
-    train_mode: str = "emd"   # "emd" (teacher-based) | "ct" (teacher-free)
+    # '+'-joined AYF terms: "emd" (teacher-based) | "ct" (teacher-free) | "lmd".
+    # e.g. "emd", "lmd", "emd+lmd", "ct+lmd". The weights only set the mix of
+    # the terms the mode enables, so lmd_weight is inert unless "lmd" is in it.
+    train_mode: str = "emd"
     emd_weight: float = 1.0
-    lmd_weight: float = 0.0
+    lmd_weight: float = 1.0
     pairwise_anchor_weight: float = 0.0
     teacher_interval_anchor_weight: float = 0.0
 
@@ -67,6 +98,14 @@ class Config:
     # Shared AYF Algorithm 1 interval schedule (same values in every arm).
     interval_p_mean: float = -0.6
     interval_p_std: float = 1.6
+
+    # AYF Algorithm 1 line 7: tangent warmup r = min(r_max, Iters / H). r scales
+    # only the (s-t)dF/dt term, so training begins as flow matching and eases
+    # the map-consistency term in. The paper uses H = 10k with far longer runs;
+    # set 0 to disable (r = 1 from step one, which is what we ran before).
+    tangent_warmup_steps: int = 2000
+    tangent_warmup_max: float = 0.99
+
 
     interval_teacher_ode_steps: int = 16
     eval_teacher_ode_steps: int = 32
@@ -127,6 +166,7 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
     }
     metrics_path = cfg.metrics_out.format(cfg.dataset)
     metrics = evaluate_density_outputs(cfg.dataset, data, outputs)
+    metrics["run_config"] = run_config_record(cfg)
     save_evaluation_samples(data, outputs, metrics_path)
     save_metrics(metrics, metrics_path)
     return metrics
@@ -141,26 +181,57 @@ def main(cfg: Config | None = None):
         ap = argparse.ArgumentParser()
         ap.add_argument("--dataset", default="8gaussians",
                         choices=["8gaussians", "two_moons", "checkerboard"])
-        ap.add_argument("--latent-dim", type=int, default=32)
+        ap.add_argument("--latent-dim", type=int, default=None)
         ap.add_argument("--teacher-steps", type=int, default=None)
         ap.add_argument("--student-steps", type=int, default=None)
-        ap.add_argument("--train-mode", default="emd", choices=["emd", "ct"])
-        ap.add_argument("--ae-latent-reg-weight", type=float, default=1e-3)
+        ap.add_argument(
+            "--train-mode", default="emd",
+            choices=["emd", "lmd", "emd+lmd", "ct", "ct+lmd"],
+        )
+        ap.add_argument("--lmd-weight", type=float, default=None)
+        ap.add_argument("--ae-latent-reg-weight", type=float, default=None)
+        ap.add_argument(
+            "--ae-ff-scale", type=float, default=None,
+            help="Fourier feature frequency scale for the encoder input. "
+                 "Omit to use the Config default (features ON); pass 0 to disable.",
+        )
+        ap.add_argument(
+            "--teacher-ff-scale", type=float, default=None,
+            help="Fourier feature frequency scale for the teacher state. "
+                 "Omit to use the Config default (features ON); pass 0 to disable.",
+        )
+        ap.add_argument(
+            "--student-ff-scale", type=float, default=None,
+            help="Fourier feature frequency scale for the student state. "
+                 "Omit to use the Config default (features ON); pass 0 to disable.",
+        )
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
         cfg = Config(
             dataset=args.dataset,
-            latent_dim=args.latent_dim,
             train_mode=args.train_mode,
-            latent_reg_weight=args.ae_latent_reg_weight,
             seed=args.seed,
             out=args.out or f"results/uniform_rf_{args.dataset}.png",
         )
         if args.teacher_steps is not None:
             cfg.teacher_steps = args.teacher_steps
+        if args.lmd_weight is not None:
+            cfg.lmd_weight = args.lmd_weight
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
+
+        for site in ("ae", "teacher", "student"):
+            value = getattr(args, f"{site}_ff_scale")
+            if value is not None:
+                # argparse None means "not supplied"; a non-positive value is the
+                # explicit way to switch a site off, since Config uses None for that.
+                setattr(cfg, f"{site}_ff_scale", value if value > 0.0 else None)
+
+        if args.ae_latent_reg_weight is not None:
+            cfg.latent_reg_weight = args.ae_latent_reg_weight
+        if args.latent_dim is not None:
+            cfg.latent_dim = args.latent_dim
 
     print(cfg)
     torch.manual_seed(cfg.seed)
@@ -173,6 +244,8 @@ def main(cfg: Config | None = None):
         hidden=cfg.hidden,
         depth=cfg.ae_depth,
         bounded=True,
+        ff_scale=cfg.ae_ff_scale,
+        ff_size=cfg.ff_size,
     ).to(cfg.device)
     print("\nTraining autoencoder...")
     train_toy_ae(ae, data_sampler, cfg)
@@ -180,12 +253,20 @@ def main(cfg: Config | None = None):
     latent_sampler = make_latent_sampler(ae, data_sampler, cfg.device)
 
     # RF teacher with a uniform base distribution
-    teacher = R.RFTeacher(cfg.latent_dim, cfg.hidden, cfg.depth).to(cfg.device)
+    teacher = R.RFTeacher(
+        cfg.latent_dim, cfg.hidden, cfg.depth,
+        ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
+        ff_input_scale=cfg.ff_input_scale,
+    ).to(cfg.device)
     print("\nTraining RF teacher...")
     R.train_teacher(teacher, latent_sampler, cfg)
 
     # AYF interval student
-    student = A.RFIntervalFlowMap(cfg.latent_dim, cfg.hidden, cfg.depth).to(cfg.device)
+    student = A.RFIntervalFlowMap(
+        cfg.latent_dim, cfg.hidden, cfg.depth,
+        ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
+        ff_input_scale=cfg.ff_input_scale,
+    ).to(cfg.device)
     print(f"\nTraining AYF interval flow map ({cfg.train_mode})...")
     A.train_student_interval(student, teacher, latent_sampler, cfg)
 
