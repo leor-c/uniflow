@@ -26,6 +26,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 
+from core.modules import apply_ff_spec
 from toy import edm_baseline, gaussian_rf, uniform_rf
 from toy.common import (
     BENCHMARK_PROTOCOL,
@@ -79,6 +80,16 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
         cfg.latent_dim = args.latent_dim
     if args.train_mode is not None:
         cfg.train_mode = args.train_mode
+    if args.ff is not None:
+        apply_ff_spec(cfg, args.ff)
+    for site in ("ae", "teacher", "student"):
+        value = getattr(args, f"{site}_ff_scale")
+        if value is not None:
+            # argparse None means "not supplied"; a non-positive value is the
+            # explicit way to switch a site off, since Config uses None for that.
+            setattr(cfg, f"{site}_ff_scale", value if value > 0.0 else None)
+    if args.ae_weight_decay is not None:
+        cfg.ae_weight_decay = args.ae_weight_decay
     if args.ae_steps is not None:
         cfg.ae_steps = args.ae_steps
     if args.teacher_steps is not None:
@@ -423,6 +434,28 @@ def main():
         help="AYF objective applied to every arm, same grammar as the "
              "individual arms. Omit to keep each arm's Config default. "
              "('ct' is uniform-only; use python -m toy.uniform_rf for it.)",
+    )
+    for _site, _where in (("ae", "the encoder input"),
+                          ("teacher", "the teacher state"),
+                          ("student", "the student state")):
+        ap.add_argument(
+            f"--{_site}-ff-scale", type=float, default=None,
+            help=f"Fourier feature frequency scale for {_where}, applied to "
+                 "every arm. Omit to use each arm's Config default (features "
+                 "ON); pass 0 to disable that site.",
+        )
+    ap.add_argument(
+        "--ff", default=None,
+        help="Which Fourier sites to enable in EVERY arm, as a letter string: "
+             "A=encoder input, T=teacher state, S=student state (e.g. 'ATS', "
+             "'AT', 'S'). 'none' disables all. Sites left out are switched OFF. "
+             "Omit to keep each arm's default. This is the knob for a "
+             "controlled Fourier ablation across the benchmark.",
+    )
+    ap.add_argument(
+        "--ae-weight-decay", type=float, default=None,
+        help="AdamW weight decay for the autoencoder in EVERY arm (default 0.01, "
+             "AdamW's own default). Pass 0 to train the AEs without decay.",
     )
     ap.add_argument("--ae-steps", type=int, default=None)
     ap.add_argument("--teacher-steps", type=int, default=None)

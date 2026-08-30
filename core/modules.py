@@ -45,6 +45,39 @@ class FourierTimeEmbedding(nn.Module):
         return torch.cat([sin, cos], dim=-1)
 
 
+# std(SiLU(x)) / std(x) for x ~ N(0, 1). PyTorch's default Linear/Conv2d init is
+# kaiming_uniform with a=sqrt(5), calibrated for LeakyReLU(sqrt(5)), not SiLU.
+# Combined with SiLU(x) = x*sigmoid(x) ~= x/2 for small x, that attenuates the
+# forward signal at every layer and compounds with depth -- measured 25x from
+# input to latent in the MNIST encoder, which drove tanh latents to |z|~0.01
+# against the 0.5 that U([-1,1]) implies.
+SILU_GAIN = 0.5595
+
+
+def init_silu_(module: nn.Module, output_layers: tuple = ()) -> None:
+    """Variance-preserving initialization for SiLU stacks.
+
+    Sets weight std to ``1 / (SILU_GAIN * sqrt(fan_in))`` so each Linear/Conv2d
+    followed by a SiLU preserves activation scale instead of shrinking it.
+
+    This matters unevenly across the benchmark: the Gaussian and EDM arms
+    rescale their latents post-hoc (``fit_latent_normalization``), so
+    attenuation is silently corrected there, while the uniform arm's base is a
+    fixed ``U([-1,1]^d)`` box with no such knob -- so the same bug lands
+    entirely on it.
+    """
+    outputs = {id(layer) for layer in output_layers}
+    for layer in module.modules():
+        if isinstance(layer, (nn.Linear, nn.Conv2d)):
+            fan_in = nn.init._calculate_correct_fan(layer.weight, "fan_in")
+            # Layers feeding a SiLU get the gain compensation; a final layer with
+            # no activation after it would otherwise amplify by 1 / SILU_GAIN.
+            gain = 1.0 if id(layer) in outputs else SILU_GAIN
+            nn.init.normal_(layer.weight, 0.0, 1.0 / (gain * math.sqrt(fan_in)))
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+
+
 class RandomFourierFeatures(nn.Module):
     """Fixed random Fourier encoding of a coordinate input.
 
@@ -98,6 +131,63 @@ class RandomFourierFeatures(nn.Module):
         return torch.cat([u, projection.sin(), projection.cos()], dim=-1)
 
 
+FF_SITE_CODES = {"a": "ae", "t": "teacher", "s": "student"}
+# Scales calibrated on the 2D toy benchmark; used only when a --ff spec turns on
+# a site whose Config leaves it off (as MNIST does for all of them).
+DEFAULT_FF_SCALES = {
+    "ae": 0.5 * math.sqrt(2.0),
+    "teacher": math.sqrt(2.0 / 3.0),
+    "student": math.sqrt(2.0 / 3.0),
+}
+
+
+def parse_ff_sites(spec: str, *, allowed=("ae", "teacher", "student")) -> frozenset[str]:
+    """Parse a Fourier-site spec into site names.
+
+    Letters select sites: ``A`` encoder input, ``T`` teacher state, ``S``
+    student state -- so ``ATS`` is all three, ``AT`` drops the student, ``S``
+    is student-only. ``none`` / ``off`` / ``-`` disables every site, ``all`` is
+    a synonym for every allowed site. Case-insensitive.
+
+    Sites not named are switched OFF, so the spec fully determines the
+    configuration rather than layering on top of whatever the defaults were.
+    """
+    text = spec.strip().lower()
+    if text in {"none", "off", "-"}:
+        return frozenset()
+    if text == "all":
+        return frozenset(allowed)
+    sites = set()
+    for char in text:
+        site = FF_SITE_CODES.get(char)
+        if site is None:
+            raise ValueError(
+                f"Unknown Fourier site {char!r} in {spec!r}: expected letters from "
+                f"{sorted(FF_SITE_CODES)} (a=ae, t=teacher, s=student), "
+                "or 'none'/'all'"
+            )
+        if site not in allowed:
+            raise ValueError(
+                f"Fourier site {site!r} is not available here; allowed: {sorted(allowed)}"
+            )
+        sites.add(site)
+    if not sites:
+        raise ValueError(f"Empty Fourier site spec {spec!r}; use 'none' to disable all")
+    return frozenset(sites)
+
+
+def apply_ff_spec(cfg, spec: str, *, allowed=("ae", "teacher", "student")) -> frozenset[str]:
+    """Set ``cfg.<site>_ff_scale`` from a spec, switching unnamed sites off."""
+    sites = parse_ff_sites(spec, allowed=allowed)
+    for site in allowed:
+        field = f"{site}_ff_scale"
+        if site not in sites:
+            setattr(cfg, field, None)
+        elif getattr(cfg, field, None) is None:
+            setattr(cfg, field, DEFAULT_FF_SCALES[site])
+    return sites
+
+
 class MLP(nn.Module):
     """Plain MLP with SiLU activations."""
 
@@ -110,6 +200,7 @@ class MLP(nn.Module):
             d = hidden
         layers.append(nn.Linear(d, out_dim))
         self.net = nn.Sequential(*layers)
+        init_silu_(self, output_layers=(self.net[-1],))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -138,6 +229,12 @@ class FiLMMLP(nn.Module):
         self.film = nn.Linear(cond_dim, 2 * hidden * depth)
         self.act = nn.SiLU()
         self.out_proj = nn.Linear(hidden, out_dim)
+        init_silu_(self, output_layers=(self.out_proj,))
+        # FiLM starts as the identity modulation (gamma = beta = 0), so the
+        # conditioning ramps in during training rather than perturbing the
+        # forward scale we just calibrated.
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         gb = self.film(cond).chunk(2 * self.depth, dim=-1)

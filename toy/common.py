@@ -129,7 +129,9 @@ def _uniform_latent_moment_regularizer(z: torch.Tensor) -> torch.Tensor:
 
 def train_toy_ae(ae: ToyAE, data_sampler, cfg) -> None:
     ae.train()
-    opt = torch.optim.AdamW(ae.parameters(), lr=cfg.ae_lr)
+    opt = torch.optim.AdamW(
+        ae.parameters(), lr=cfg.ae_lr, weight_decay=cfg.ae_weight_decay
+    )
     for step in range(1, cfg.ae_steps + 1):
         x = data_sampler(cfg.batch_size)
         x_hat, z = ae(x)
@@ -367,13 +369,13 @@ def evaluate_density_outputs(
 # this, latent_dim / train_mode / the Fourier scales are unrecoverable from the
 # artifacts alone.
 RUN_CONFIG_FIELDS = (
-    "dataset", "seed", "latent_dim", "hidden", "depth", "ae_depth",
+    "dataset", "seed", "latent_dim", "hidden", "depth", "ae_hidden", "ae_depth",
     "ae_steps", "teacher_steps", "edm_teacher_steps", "student_steps",
     "batch_size", "train_mode", "emd_weight", "lmd_weight",
     "jvp_dt_ref", "time_eps", "interval_p_mean", "interval_p_std",
     "tangent_warmup_steps", "tangent_warmup_max",
     "ff_size", "ae_ff_scale", "teacher_ff_scale", "student_ff_scale",
-    "ff_input_scale", "latent_reg_weight", "base_std",
+    "ff_input_scale", "latent_reg_weight", "base_std", "ae_weight_decay",
     "sigma_data", "sigma_min", "sigma_max", "edm_rho", "edm_p_mean", "edm_p_std",
 )
 
@@ -430,6 +432,66 @@ def save_benchmark_figure(
     fig.savefig(path, dpi=160, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
     print(f"Saved figure -> {path}")
+
+
+def latent_figure_path(output_path: str) -> str:
+    """Sibling path for the latent-space figure: ``foo.png`` -> ``foo_latent.png``."""
+    path = Path(output_path)
+    return str(path.with_name(f"{path.stem}_latent{path.suffix}"))
+
+
+def save_latent_figure(
+    panels: list[tuple[str, torch.Tensor]],
+    output_path: str,
+    box: float | None = None,
+) -> None:
+    """Scatter the same distributions the benchmark figure shows, in latent space.
+
+    Only meaningful at ``latent_dim == 2``, where the latent is a plane we can
+    draw directly. The data-space figure shows everything after the decoder,
+    which hides whether a failure is the generative model missing the latent
+    distribution or the decoder mapping it somewhere unexpected -- those look
+    identical once decoded.
+
+    Unlike ``save_benchmark_figure``, the limits are derived from the data
+    rather than fixed: latent scale differs by arm (bounded latents live in
+    ``(-1,1)^2``, standardized ones have tails past 3), so a shared hardcoded
+    window would clip one arm and shrink the other to a dot.
+
+    ``box`` draws a reference square, used by the bounded arm to show the
+    ``U([-1,1]^2)`` support the base samples from -- so latents that fail to
+    fill the box are visible rather than inferred from a summary statistic.
+    """
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # A robust radius, so a handful of outliers cannot collapse every panel.
+    finite = [p.detach().cpu().flatten() for _, p in panels]
+    radius = max(t.abs().quantile(0.999).item() for t in finite if t.numel())
+    limit = max(1.15 * radius, (box or 0.0) * 1.15, 1e-3)
+
+    fig, axes = plt.subplots(
+        1, len(panels),
+        figsize=(3.6 * len(panels), 4.0),
+        sharex=True, sharey=True, constrained_layout=True,
+    )
+    axes = [axes] if len(panels) == 1 else list(axes)
+    for ax, (title, pts) in zip(axes, panels):
+        pts = pts.detach().cpu()
+        ax.scatter(pts[:, 0], pts[:, 1], s=2, alpha=0.45)
+        if box is not None:
+            ax.add_patch(plt.Rectangle(
+                (-box, -box), 2 * box, 2 * box,
+                fill=False, linestyle="--", linewidth=0.9, edgecolor="crimson",
+            ))
+        ax.set_title(title, pad=10)
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(-limit, limit)
+        ax.set_aspect("equal")
+        ax.grid(True, linewidth=0.3)
+    fig.savefig(path, dpi=160, bbox_inches="tight", pad_inches=0.12)
+    plt.close(fig)
+    print(f"Saved latent figure -> {path}")
 
 
 def save_metrics(metrics: dict, output_path: str) -> None:

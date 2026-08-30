@@ -18,12 +18,15 @@ import torch
 
 from core import rf as R
 from core import ayf_rf as A
+from core.modules import apply_ff_spec
 from toy.common import (
     ToyAE,
     evaluate_density_outputs,
     make_data_sampler,
     make_latent_sampler,
     save_benchmark_figure,
+    save_latent_figure,
+    latent_figure_path,
     run_config_record,
     save_metrics,
     save_evaluation_samples,
@@ -47,10 +50,28 @@ class Config:
     # coincide. Larger values are an expansion, where a 2D manifold sits in a
     # much bigger space and the extra directions absorb student error.
     latent_dim: int = 2
-    hidden: int = 128
-    ae_depth: int = 2
-    ae_steps: int = 20000
+    hidden: int = 64
+    # Width of the autoencoder trunk, independent of the teacher/student
+    # ``hidden`` below: the AE fits a 2-D reconstruction, the flow models fit a
+    # velocity field over the latent, and there is no reason those need the same
+    # capacity. Pairs with ``ae_depth``, which was already separate.
+    ae_hidden: int = 128
+    ae_depth: int = 3
+    ae_steps: int = 40000
     ae_lr: float = 1e-3
+    # AdamW's default weight_decay is 0.01, which was never a deliberate choice
+    # here -- the AE is a fixed feature extractor, not a model we need to
+    # regularize for generalization. Decay on the encoder shrinks its weights,
+    # which for the tanh head pulls pre-activations toward 0 and the latents
+    # toward the origin while the decoder simply rescales to compensate; the
+    # reconstruction loss is indifferent to that trade, so nothing pushes back.
+    # That is the leading suspect for MNIST bounded latents sitting at
+    # mean|z| ~ 0.17 against the 0.5 that U([-1,1]) implies. Set 0 to disable.
+    # Measured on this 2D toy: 0.01 vs 0 moves mean|z| by <0.005 (0.644 vs
+    # 0.641, seed 1), far less than the seed spread, and the bounded latents
+    # already sit at/above the 0.5 target -- so the knob is inert here and
+    # the deeper MNIST encoder is where it could actually bite.
+    ae_weight_decay: float = 0.01
     # Off by default: at latent_dim=2 the moment penalty is unnecessary (it
     # changes 1-step NLL by less than the seed spread). It is NOT optional at
     # large latent_dim -- without it the encoder collapses coordinates and the
@@ -65,7 +86,7 @@ class Config:
     # independent: encoder input, teacher state, student state.
     # Scales are divided by ``ff_input_scale`` below, so one nominal value means
     # the same effective frequency in every arm.
-    ff_size: int = 64
+    ff_size: int = 16
     # Kept identical to the other arms: the encoder input is the same 2D data
     # everywhere, so an arm-specific scale would make the comparison uncontrolled.
     ae_ff_scale: float | None = 0.5 * math.sqrt(2.0)
@@ -76,7 +97,7 @@ class Config:
 
 
     # RF teacher
-    depth: int = 4
+    depth: int = 3
     teacher_steps: int = 10000
     teacher_lr: float = 1e-3
 
@@ -164,6 +185,23 @@ def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
         "student_1_step": s1,
         f"student_{cfg.sample_k}_step": sk,
     }
+    # At latent_dim == 2 the latent is a plane, so the same distributions can be
+    # drawn before the decoder -- which separates "the flow model missed the
+    # latent distribution" from "the decoder moved it", indistinguishable once
+    # decoded. Silently skipped at any other dimension.
+    if cfg.latent_dim == 2 and cfg.save_figure:
+        save_latent_figure(
+            [
+                ("Encoded data", ae.encode(x_real)),
+                ("Base  U([-1,1]^2)", R.sample_uniform_noise(n, cfg.latent_dim, cfg.device)),
+                ("Uniform RF (ODE)", teacher_z),
+                ("AYF (1-step)", s1_z),
+                (f"AYF ({cfg.sample_k}-step)", sk_z),
+            ],
+            latent_figure_path(cfg.out.format(cfg.dataset)),
+            box=1.0,
+        )
+
     metrics_path = cfg.metrics_out.format(cfg.dataset)
     metrics = evaluate_density_outputs(cfg.dataset, data, outputs)
     metrics["run_config"] = run_config_record(cfg)
@@ -205,6 +243,19 @@ def main(cfg: Config | None = None):
             help="Fourier feature frequency scale for the student state. "
                  "Omit to use the Config default (features ON); pass 0 to disable.",
         )
+        ap.add_argument(
+            "--ff", default=None,
+            help="Which Fourier sites to enable, as a letter string: A=encoder "
+                 "input, T=teacher state, S=student state (e.g. 'ATS', 'AT', "
+                 "'S'). 'none' disables all. Sites left out are switched OFF. "
+                 "Omit to keep the Config defaults; --*-ff-scale overrides the "
+                 "frequency of a site this turns on.",
+        )
+        ap.add_argument(
+            "--ae-weight-decay", type=float, default=None,
+            help="AdamW weight decay for the autoencoder (default 0.01, AdamW's "
+                 "own default). Pass 0 to train the AE without decay.",
+        )
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
@@ -221,6 +272,8 @@ def main(cfg: Config | None = None):
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
 
+        if args.ff is not None:
+            apply_ff_spec(cfg, args.ff)
         for site in ("ae", "teacher", "student"):
             value = getattr(args, f"{site}_ff_scale")
             if value is not None:
@@ -230,6 +283,8 @@ def main(cfg: Config | None = None):
 
         if args.ae_latent_reg_weight is not None:
             cfg.latent_reg_weight = args.ae_latent_reg_weight
+        if args.ae_weight_decay is not None:
+            cfg.ae_weight_decay = args.ae_weight_decay
         if args.latent_dim is not None:
             cfg.latent_dim = args.latent_dim
 
@@ -241,7 +296,7 @@ def main(cfg: Config | None = None):
     # Tanh-bounded AE
     ae = ToyAE(
         latent_dim=cfg.latent_dim,
-        hidden=cfg.hidden,
+        hidden=cfg.ae_hidden,
         depth=cfg.ae_depth,
         bounded=True,
         ff_scale=cfg.ae_ff_scale,

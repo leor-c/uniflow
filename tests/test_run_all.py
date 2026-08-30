@@ -38,17 +38,23 @@ def _pipeline_metrics(value: float, *, protocol: bool = False) -> dict:
     return metrics
 
 
+def _args(**overrides):
+    """A run_all argparse Namespace with every flag defaulted to "not supplied"."""
+    fields = dict(
+        dataset=None, latent_dim=None, ae_steps=None, teacher_steps=None,
+        student_steps=None, train_mode=None, ff=None, ae_weight_decay=None,
+        ae_ff_scale=None, teacher_ff_scale=None, student_ff_scale=None,
+    )
+    unknown = set(overrides) - set(fields)
+    assert not unknown, f"unknown run_all flag(s): {sorted(unknown)}"
+    fields.update(overrides)
+    return Namespace(**fields)
+
+
 class RunAllAggregationTests(unittest.TestCase):
     def test_shared_overrides_include_latent_dimension(self):
         cfg = _Config()
-        args = Namespace(
-            dataset=None,
-            latent_dim=8,
-            ae_steps=None,
-            teacher_steps=None,
-            student_steps=None,
-            train_mode=None,
-        )
+        args = _args(latent_dim=8)
 
         result = _apply_overrides(
             cfg,
@@ -67,8 +73,7 @@ class RunAllAggregationTests(unittest.TestCase):
         from toy.run_all import PIPELINE_MODULES, PIPELINES
 
         def resolve(mode):
-            args = Namespace(dataset=None, latent_dim=None, ae_steps=None,
-                             teacher_steps=None, student_steps=None, train_mode=mode)
+            args = _args(train_mode=mode)
             out = {}
             for pipeline in PIPELINES:
                 module, teacher_field, student_field = PIPELINE_MODULES[pipeline]
@@ -83,6 +88,103 @@ class RunAllAggregationTests(unittest.TestCase):
         self.assertEqual(set(resolve("emd+lmd").values()), {"emd+lmd"})
         # omitted -> each arm keeps its own default rather than being forced
         self.assertEqual(resolve(None), {p: "emd" for p in PIPELINES})
+
+    def test_fourier_override_reaches_every_arm_and_zero_disables(self):
+        """run_all must be able to ablate the Fourier sites across all arms."""
+        from toy.run_all import PIPELINE_MODULES, PIPELINES
+
+        def resolve(value):
+            args = _args(ae_ff_scale=value, teacher_ff_scale=value,
+                         student_ff_scale=value)
+            out = {}
+            for pipeline in PIPELINES:
+                module, teacher_field, student_field = PIPELINE_MODULES[pipeline][:3]
+                cfg = _apply_overrides(
+                    module.Config(device="cpu"), args, seed=1,
+                    teacher_field=teacher_field, student_field=student_field,
+                )
+                out[pipeline] = (cfg.ae_ff_scale, cfg.teacher_ff_scale, cfg.student_ff_scale)
+            return out
+
+        # 0 disables every site on every arm
+        self.assertEqual(set(resolve(0.0).values()), {(None, None, None)})
+        # omitted keeps each arm's default, which is features ON
+        for scales in resolve(None).values():
+            self.assertTrue(all(s is not None for s in scales))
+
+    def test_ff_spec_selects_sites_across_every_arm(self):
+        """--ff ATS/AT/S must turn exactly the named sites on and the rest off."""
+        from toy.run_all import PIPELINE_MODULES, PIPELINES
+
+        def resolve(spec):
+            args = _args(ff=spec)
+            out = {}
+            for pipeline in PIPELINES:
+                module, teacher_field, student_field = PIPELINE_MODULES[pipeline][:3]
+                cfg = _apply_overrides(
+                    module.Config(device="cpu"), args, seed=1,
+                    teacher_field=teacher_field, student_field=student_field,
+                )
+                out[pipeline] = tuple(
+                    getattr(cfg, f"{site}_ff_scale") is not None
+                    for site in ("ae", "teacher", "student")
+                )
+            return out
+
+        for spec, expected in [
+            ("ATS", (True, True, True)),
+            ("AT", (True, True, False)),
+            ("S", (False, False, True)),
+            ("ats", (True, True, True)),
+            ("none", (False, False, False)),
+        ]:
+            with self.subTest(spec=spec):
+                self.assertEqual(set(resolve(spec).values()), {expected})
+
+    def test_ff_spec_and_explicit_scale_compose(self):
+        """--ff picks the sites; an explicit --*-ff-scale still sets the value."""
+        from toy.run_all import PIPELINE_MODULES
+
+        module, teacher_field, student_field = PIPELINE_MODULES["uniform_rf"][:3]
+        cfg = _apply_overrides(
+            module.Config(device="cpu"), _args(ff="AT", teacher_ff_scale=2.5),
+            seed=1, teacher_field=teacher_field, student_field=student_field,
+        )
+        self.assertEqual(cfg.teacher_ff_scale, 2.5)
+        self.assertIsNotNone(cfg.ae_ff_scale)
+        self.assertIsNone(cfg.student_ff_scale)
+
+    def test_ae_weight_decay_override_reaches_every_arm(self):
+        """--ae-weight-decay must apply to all arms; 0 is a real value, not 'unset'."""
+        from toy.run_all import PIPELINE_MODULES, PIPELINES
+
+        def resolve(value):
+            args = _args(ae_weight_decay=value)
+            out = {}
+            for pipeline in PIPELINES:
+                module, teacher_field, student_field = PIPELINE_MODULES[pipeline][:3]
+                cfg = _apply_overrides(
+                    module.Config(device="cpu"), args, seed=1,
+                    teacher_field=teacher_field, student_field=student_field,
+                )
+                out[pipeline] = cfg.ae_weight_decay
+            return out
+
+        self.assertEqual(set(resolve(0.0).values()), {0.0})
+        self.assertEqual(set(resolve(0.05).values()), {0.05})
+        # omitted -> each arm keeps its default, which is AdamW's own 0.01
+        self.assertEqual(set(resolve(None).values()), {0.01})
+
+    def test_ff_spec_rejects_unknown_letters(self):
+        from core.modules import parse_ff_sites
+
+        for bad in ("AX", "", "A S", "aa t"):
+            with self.subTest(spec=bad):
+                with self.assertRaises(ValueError):
+                    parse_ff_sites(bad)
+        # the AE site does not exist in the MNIST arms
+        with self.assertRaises(ValueError):
+            parse_ff_sites("ATS", allowed=("teacher", "student"))
 
     def test_every_pipeline_has_a_module_and_label(self):
         from toy.run_all import PIPELINE_LABELS, PIPELINE_MODULES, PIPELINES

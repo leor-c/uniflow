@@ -27,6 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from core.modules import init_silu_
+
 
 # ---------------------------------------------------------------------------
 # Architecture
@@ -55,6 +57,7 @@ class MNISTEncoder(nn.Module):
             nn.SiLU(),
         )
         self.head = nn.Linear(128 * 7 * 7, latent_dim)
+        init_silu_(self, output_layers=(self.head,))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Raw encoder output; the tanh boundary applies only to bounded latents."""
@@ -159,6 +162,7 @@ def train_mnist_ae(
     lr: float,
     device: str | torch.device,
     latent_spread_weight: float = 1e-3,
+    weight_decay: float = 0.01,
     log_every: int = 500,
 ) -> None:
     """
@@ -171,7 +175,7 @@ distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
     """
     ae.to(device)
     ae.train()
-    opt = torch.optim.AdamW(ae.parameters(), lr=lr)
+    opt = torch.optim.AdamW(ae.parameters(), lr=lr, weight_decay=weight_decay)
     data_iter = _infinite(loader)
 
     for step in range(1, iters + 1):
