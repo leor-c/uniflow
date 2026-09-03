@@ -24,6 +24,8 @@ import matplotlib.pyplot as plt
 from core import ayf as A
 from core import edm as E
 from core.autoencoder import freeze
+from core.modules import apply_ff_spec
+from core.seeding import seed_stream, stream_generator
 from mnist.ae import (
     MNISTAutoEncoder,
     train_mnist_ae,
@@ -47,6 +49,13 @@ class Config:
     latent_dim: int = 64
     ae_steps: int = 20000
     ae_lr: float = 1e-3
+    # AdamW's default weight_decay is 0.01, which was never a deliberate choice
+    # here. Decay on the encoder shrinks its weights, which for the tanh head
+    # pulls pre-activations toward 0 and the latents toward the origin while the
+    # decoder rescales to compensate -- the reconstruction loss is indifferent
+    # to that trade. Leading suspect for the bounded latents sitting at
+    # mean|z| ~ 0.17 against the 0.5 that U([-1,1]) implies. Set 0 to disable.
+    ae_weight_decay: float = 0.01
     ae_batch_size: int = 256
     latent_spread_weight: float = 1e-3
 
@@ -221,6 +230,17 @@ def main(cfg: Config | None = None):
             choices=["emd", "lmd", "emd+lmd"],
         )
         ap.add_argument("--lmd_weight", type=float, default=None)
+        ap.add_argument(
+            "--ff", default=None,
+            help="Which Fourier sites to enable, as a letter string: T=teacher "
+                 "state, S=student state (e.g. 'TS', 'T'). 'none' disables all. "
+                 "Sites left out are switched OFF.",
+        )
+        ap.add_argument(
+            "--ae_weight_decay", type=float, default=None,
+            help="AdamW weight decay for the autoencoder (default 0.01, AdamW's "
+                 "own default). Pass 0 to train the AE without decay.",
+        )
         ap.add_argument("--out_dir", default="results/mnist/edm_ayf")
         ap.add_argument("--data_root", default="./data")
         args = ap.parse_args()
@@ -234,36 +254,52 @@ def main(cfg: Config | None = None):
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
         cfg.train_mode = args.student_mode
+        if args.ff is not None:
+            apply_ff_spec(cfg, args.ff, allowed=("teacher", "student"))
         if args.lmd_weight is not None:
             cfg.lmd_weight = args.lmd_weight
+        if args.ae_weight_decay is not None:
+            cfg.ae_weight_decay = args.ae_weight_decay
         cfg.out_dir = args.out_dir
         cfg.data_root = args.data_root
 
     print(cfg)
-    torch.manual_seed(cfg.seed)
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     # --- Data ---
+    # One RNG stream per role, all derived from cfg.seed. A single global
+    # manual_seed makes weight init, data order, training noise and the figure
+    # draws share one stream, so arms with different architectures diverge on
+    # their first parameter tensor and never see the same data again.
     train_loader = make_mnist_data_loader(
         cfg.data_root, train=True, batch_size=cfg.ae_batch_size,
+        generator=stream_generator(cfg.seed, "ae-data"),
+    )
+    # Fixed dataset order: the encoded latent matrix and the figure inputs are
+    # then the same rows and the same digits in every arm.
+    ordered_loader = make_mnist_data_loader(
+        cfg.data_root, train=True, batch_size=cfg.ae_batch_size, shuffle=False,
     )
 
     # --- AE ---
+    seed_stream(cfg.seed, "ae-init")
     ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim, bounded=False).to(cfg.device)
     print("\nTraining MNIST autoencoder...")
+    seed_stream(cfg.seed, "ae-train")
     train_mnist_ae(
         ae, train_loader,
         iters=cfg.ae_steps,
         lr=cfg.ae_lr,
         device=cfg.device,
         latent_spread_weight=cfg.latent_spread_weight,
+        weight_decay=cfg.ae_weight_decay,
         log_every=cfg.log_every,
     )
     torch.save(ae.state_dict(), os.path.join(cfg.out_dir, "ae.pt"))
 
     # --- Pre-encode training set ---
     print("\nEncoding training data...")
-    all_latents = encode_dataset(ae, train_loader, cfg.device)
+    all_latents = encode_dataset(ae, ordered_loader, cfg.device)
     print(
         f"  latents: {all_latents.shape}  "
         f"mean_abs={all_latents.abs().mean():.3f}  "
@@ -271,15 +307,22 @@ def main(cfg: Config | None = None):
     )
     freeze(ae)
 
-    latent_sampler = make_mnist_latent_sampler(all_latents, cfg.device)
+    teacher_latents = make_mnist_latent_sampler(
+        all_latents, cfg.device, generator=stream_generator(cfg.seed, "teacher-data")
+    )
+    student_latents = make_mnist_latent_sampler(
+        all_latents, cfg.device, generator=stream_generator(cfg.seed, "student-data")
+    )
 
     # --- EDM teacher ---
+    seed_stream(cfg.seed, "teacher-init")
     teacher = E.EDMPrecondDenoiser(
         cfg.latent_dim, cfg.hidden, cfg.depth, cfg.sigma_data,
         ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
     ).to(cfg.device)
     print("\nTraining EDM teacher in latent space...")
-    E.train_edm_teacher(teacher, latent_sampler, cfg)
+    seed_stream(cfg.seed, "teacher-train")
+    E.train_edm_teacher(teacher, teacher_latents, cfg)
     torch.save(teacher.state_dict(), os.path.join(cfg.out_dir, "teacher.pt"))
 
     # --- EDM AYF student ---
@@ -288,18 +331,29 @@ def main(cfg: Config | None = None):
     flow_teacher = E.EDMFlowVelocity(
         teacher, sigma_min=cfg.sigma_min, sigma_max=cfg.sigma_max,
     ).to(cfg.device)
+    seed_stream(cfg.seed, "student-init")
     student = A.RFIntervalFlowMap(
         cfg.latent_dim, cfg.hidden, cfg.depth,
         ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
     print(f"\nTraining EDM + AYF student ({cfg.train_mode})...")
-    A.train_student_ayf(student, flow_teacher, latent_sampler, cfg)
+    seed_stream(cfg.seed, "student-train")
+    A.train_student_ayf(student, flow_teacher, student_latents, cfg)
     torch.save(student.state_dict(), os.path.join(cfg.out_dir, "student.pt"))
 
     # --- Visualise ---
     print("\nGenerating sample plots...")
-    make_plots(ae, teacher, student, cfg, train_loader)
+    seed_stream(cfg.seed, "evaluation")
+    make_plots(ae, teacher, student, cfg, ordered_loader)
+
+    # These arms emit image grids rather than metrics, so nothing else would
+    # record which configuration produced them. Write it alongside the grids.
+    import dataclasses, json
+    config_path = os.path.join(cfg.out_dir, "run_config.json")
+    with open(config_path, "w") as handle:
+        json.dump(dataclasses.asdict(cfg), handle, indent=2, sort_keys=True, default=str)
+    print(f"Saved run config -> {config_path}")
     print(f"\nAll outputs in {cfg.out_dir}/")
 
 

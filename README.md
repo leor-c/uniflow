@@ -159,6 +159,28 @@ features. On unbounded latents *alone* they degrade one-step results sharply —
 the sinusoids alias in the tails, where the samples that dominate the fidelity
 metric live.
 
+#### Ablating them
+
+`--ff` takes a letter string naming the sites to enable — `A` encoder input,
+`T` teacher state, `S` student state — and switches every site it does *not*
+name off, so the string fully determines the configuration:
+
+```bash
+python -m toy.run_all --ff ATS       # all three (the default configuration)
+python -m toy.run_all --ff AT        # no student-side features
+python -m toy.run_all --ff A         # encoder input only
+python -m toy.run_all --ff none      # no Fourier features anywhere
+```
+
+On `run_all` it applies uniformly to all three arms, which is what makes the
+ablation controlled; the same flag works on each arm's own entry point. The
+MNIST arms have no encoder-input site, so there `--ff` accepts only `T` and `S`.
+
+`--ff` chooses the sites; `--ae-ff-scale` / `--teacher-ff-scale` /
+`--student-ff-scale` set the frequency of a site (and a value of `0` also
+disables one). MNIST leaves all sites off by default, so `--ff` there turns them
+on at the toy-calibrated scales in `DEFAULT_FF_SCALES`.
+
 ### Distillation objective
 
 `train_mode` selects the AYF objective: `emd`, `lmd`, or `emd+lmd` (plus `ct`,

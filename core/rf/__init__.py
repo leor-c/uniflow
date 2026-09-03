@@ -14,7 +14,7 @@ from .sampling import (
     sample_uniform_noise,
 )
 from .losses import rf_teacher_loss
-from .training import train_teacher
+from .training import train_teacher, train_teacher_reflow, generate_reflow_pairs
 
 __all__ = [
     "RFTeacher",
@@ -26,4 +26,6 @@ __all__ = [
     "sample_uniform_noise",
     "rf_teacher_loss",
     "train_teacher",
+    "train_teacher_reflow",
+    "generate_reflow_pairs",
 ]

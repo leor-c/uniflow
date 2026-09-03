@@ -19,11 +19,12 @@ import torch
 from core import rf as R
 from core import ayf_rf as A
 from core.modules import apply_ff_spec
+from core.seeding import seed_stream
 from toy.common import (
     ToyAE,
     evaluate_density_outputs,
-    make_data_sampler,
     make_latent_sampler,
+    make_run_samplers,
     save_benchmark_figure,
     save_latent_figure,
     latent_figure_path,
@@ -50,13 +51,13 @@ class Config:
     # coincide. Larger values are an expansion, where a 2D manifold sits in a
     # much bigger space and the extra directions absorb student error.
     latent_dim: int = 2
-    hidden: int = 64
+    hidden: int = 256
     # Width of the autoencoder trunk, independent of the teacher/student
     # ``hidden`` below: the AE fits a 2-D reconstruction, the flow models fit a
     # velocity field over the latent, and there is no reason those need the same
     # capacity. Pairs with ``ae_depth``, which was already separate.
     ae_hidden: int = 128
-    ae_depth: int = 3
+    ae_depth: int = 2
     ae_steps: int = 40000
     ae_lr: float = 1e-3
     # AdamW's default weight_decay is 0.01, which was never a deliberate choice
@@ -86,7 +87,7 @@ class Config:
     # independent: encoder input, teacher state, student state.
     # Scales are divided by ``ff_input_scale`` below, so one nominal value means
     # the same effective frequency in every arm.
-    ff_size: int = 16
+    ff_size: int = 64
     # Kept identical to the other arms: the encoder input is the same 2D data
     # everywhere, so an arm-specific scale would make the comparison uncontrolled.
     ae_ff_scale: float | None = 0.5 * math.sqrt(2.0)
@@ -97,18 +98,32 @@ class Config:
 
 
     # RF teacher
-    depth: int = 3
-    teacher_steps: int = 10000
+    depth: int = 4
+    teacher_steps: int = 80_000
     teacher_lr: float = 1e-3
+
+    # --- ReFlow (Liu et al. 2022, "Flow Straight and Fast") -------------------
+    # After the teacher is fit, refit it on its own ODE coupling
+    # ``(z0, ODE(z0))``. 1-RF trains on independent pairs, so paths cross and the
+    # velocity is an average over crossings -- curved, and poorly served by one
+    # Euler step. The coupling does not cross, so each round straightens the
+    # field, which is exactly what 1-step sampling and AYF distillation need.
+    # 0 = plain 1-RF (default), 1 = 2-RF, 2 = 3-RF.
+    reflow_rounds: int = 0
+    reflow_steps: int = 20000
+    reflow_pairs: int = 200_000
+    # Accuracy of the coupling. Each round targets the previous ODE rather than
+    # the data, so too few steps here bakes integration error into the teacher.
+    reflow_ode_steps: int = 256
 
     # AYF interval student
     student_lr: float = 1e-3
-    student_steps: int = 10000
+    student_steps: int = 80_000
 
     # '+'-joined AYF terms: "emd" (teacher-based) | "ct" (teacher-free) | "lmd".
     # e.g. "emd", "lmd", "emd+lmd", "ct+lmd". The weights only set the mix of
     # the terms the mode enables, so lmd_weight is inert unless "lmd" is in it.
-    train_mode: str = "emd"
+    train_mode: str = "lmd"
     emd_weight: float = 1.0
     lmd_weight: float = 1.0
     pairwise_anchor_weight: float = 0.0
@@ -136,7 +151,7 @@ class Config:
     batch_size: int = 64
     sample_k: int = 8
     sample_schedule: str = "uniform"
-    sample_clamp: bool = False
+    sample_clamp: bool = True
 
     log_every: int = 500
     save_figure: bool = True
@@ -149,19 +164,19 @@ class Config:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def make_plot(ae: ToyAE, teacher, student, data_sampler, cfg: Config):
+def make_plot(ae: ToyAE, teacher, student, eval_sampler, cfg: Config):
     n = 5000
-    data = data_sampler(n).cpu()
+    data = eval_sampler(n).cpu()
 
-    x_real = data_sampler(n).to(cfg.device)
+    x_real = eval_sampler(n).to(cfg.device)
     x_hat = ae.decode(ae.encode(x_real)).cpu()
 
     teacher_z = R.sample_teacher_latents(
         teacher, n, cfg.latent_dim, cfg.device, steps=cfg.teacher_sample_steps
-    )
+    ).clamp(-1, 1)
     teacher_samples = ae.decode(teacher_z).cpu()
 
-    s1_z = A.sample_student_latents_one_step(student, n, cfg.latent_dim, cfg.device)
+    s1_z = A.sample_student_latents_one_step(student, n, cfg.latent_dim, cfg.device).clamp(-1, 1)
     s1 = ae.decode(s1_z).cpu()
 
     sk_z = A.sample_student_latents_k_step(
@@ -223,7 +238,7 @@ def main(cfg: Config | None = None):
         ap.add_argument("--teacher-steps", type=int, default=None)
         ap.add_argument("--student-steps", type=int, default=None)
         ap.add_argument(
-            "--train-mode", default="emd",
+            "--train-mode", default="lmd",
             choices=["emd", "lmd", "emd+lmd", "ct", "ct+lmd"],
         )
         ap.add_argument("--lmd-weight", type=float, default=None)
@@ -256,6 +271,13 @@ def main(cfg: Config | None = None):
             help="AdamW weight decay for the autoencoder (default 0.01, AdamW's "
                  "own default). Pass 0 to train the AE without decay.",
         )
+        ap.add_argument(
+            "--reflow-rounds", type=int, default=None,
+            help="ReFlow rounds after the teacher fit: 0 = plain 1-RF (default), "
+                 "1 = 2-RF, 2 = 3-RF. Straightens the velocity field.",
+        )
+        ap.add_argument("--reflow-steps", type=int, default=None,
+                        help="Training steps per ReFlow round.")
         ap.add_argument("--seed", type=int, default=1)
         ap.add_argument("--out", default=None)
         args = ap.parse_args()
@@ -285,15 +307,23 @@ def main(cfg: Config | None = None):
             cfg.latent_reg_weight = args.ae_latent_reg_weight
         if args.ae_weight_decay is not None:
             cfg.ae_weight_decay = args.ae_weight_decay
+        if args.reflow_rounds is not None:
+            cfg.reflow_rounds = args.reflow_rounds
+        if args.reflow_steps is not None:
+            cfg.reflow_steps = args.reflow_steps
         if args.latent_dim is not None:
             cfg.latent_dim = args.latent_dim
 
     print(cfg)
-    torch.manual_seed(cfg.seed)
-
-    data_sampler = make_data_sampler(cfg.dataset, cfg.device)
+    # One RNG stream per role, all derived from cfg.seed. A single global
+    # manual_seed makes every consumer -- weight init, data, training noise,
+    # evaluation draws -- share one stream, so arms with different
+    # architectures diverge on their first parameter tensor and never see the
+    # same data again. Named streams keep each role a function of the seed only.
+    samplers = make_run_samplers(cfg)
 
     # Tanh-bounded AE
+    seed_stream(cfg.seed, "ae-init")
     ae = ToyAE(
         latent_dim=cfg.latent_dim,
         hidden=cfg.ae_hidden,
@@ -303,30 +333,37 @@ def main(cfg: Config | None = None):
         ff_size=cfg.ff_size,
     ).to(cfg.device)
     print("\nTraining autoencoder...")
-    train_toy_ae(ae, data_sampler, cfg)
+    seed_stream(cfg.seed, "ae-train")
+    train_toy_ae(ae, samplers.ae, cfg)
 
-    latent_sampler = make_latent_sampler(ae, data_sampler, cfg.device)
+    teacher_latents = make_latent_sampler(ae, samplers.teacher, cfg.device)
+    student_latents = make_latent_sampler(ae, samplers.student, cfg.device)
 
     # RF teacher with a uniform base distribution
+    seed_stream(cfg.seed, "teacher-init")
     teacher = R.RFTeacher(
         cfg.latent_dim, cfg.hidden, cfg.depth,
         ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
     print("\nTraining RF teacher...")
-    R.train_teacher(teacher, latent_sampler, cfg)
+    seed_stream(cfg.seed, "teacher-train")
+    R.train_teacher(teacher, teacher_latents, cfg)
 
     # AYF interval student
+    seed_stream(cfg.seed, "student-init")
     student = A.RFIntervalFlowMap(
         cfg.latent_dim, cfg.hidden, cfg.depth,
         ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
     print(f"\nTraining AYF interval flow map ({cfg.train_mode})...")
-    A.train_student_interval(student, teacher, latent_sampler, cfg)
+    seed_stream(cfg.seed, "student-train")
+    A.train_student_interval(student, teacher, student_latents, cfg)
 
     print("\nPlotting...")
-    return make_plot(ae, teacher, student, data_sampler, cfg)
+    seed_stream(cfg.seed, "evaluation")
+    return make_plot(ae, teacher, student, samplers.evaluation, cfg)
 
 
 if __name__ == "__main__":

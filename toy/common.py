@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import matplotlib.pyplot as plt
 import torch
@@ -12,11 +14,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from core.modules import MLP, RandomFourierFeatures
+from core.seeding import stream_generator
 from toy.datasets import get_sampler
 
 DENSITY_SAMPLES = 2048
 DENSITY_PROTOCOL = "exact-target-nll-kde-coverage-three-sigma-support-v1"
-BENCHMARK_PROTOCOL = "global-scalar-latent-scale-edm-flow-matching-ayf-v5"
+# v6 split the run into named RNG streams (see core.seeding). Before it, the
+# arms shared one global stream and were trained and evaluated on different
+# data at the same seed, so v5 numbers are not comparable with v6 ones -- the
+# bump is what makes ``run_all --resume`` refuse to reuse them.
+BENCHMARK_PROTOCOL = "global-scalar-latent-scale-edm-flow-matching-ayf-v6"
 LATENT_NORMALIZATION_SAMPLES = 4096
 TARGET_NOISE_SCALES = {
     "8gaussians": 0.035,
@@ -31,14 +38,15 @@ def sample_8gaussians(
     device: str | torch.device,
     radius: float = 0.75,
     std: float = 0.035,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Eight isotropic Gaussian modes arranged on a circle."""
-    k = torch.randint(0, 8, (batch_size,), device=device)
+    k = torch.randint(0, 8, (batch_size,), device=device, generator=generator)
     angles = 2 * math.pi * k.float() / 8.0
     centers = torch.stack(
         [radius * torch.cos(angles), radius * torch.sin(angles)], dim=-1
     )
-    return centers + std * torch.randn(batch_size, 2, device=device)
+    return centers + std * torch.randn(batch_size, 2, device=device, generator=generator)
 
 
 class ToyAE(nn.Module):
@@ -127,7 +135,14 @@ def _uniform_latent_moment_regularizer(z: torch.Tensor) -> torch.Tensor:
     return mean_loss + second_moment_loss
 
 
-def train_toy_ae(ae: ToyAE, data_sampler, cfg) -> None:
+def train_toy_ae(ae: ToyAE, data_sampler, cfg, calibration_sampler=None) -> None:
+    """Train the toy autoencoder, then fit latent normalization if unbounded.
+
+    ``calibration_sampler`` lets the normalization batch come from its own RNG
+    stream. Drawing it from ``data_sampler`` instead would advance the training
+    stream by a different amount in the bounded and unbounded arms, so the
+    teacher phases would no longer see the same data.
+    """
     ae.train()
     opt = torch.optim.AdamW(
         ae.parameters(), lr=cfg.ae_lr, weight_decay=cfg.ae_weight_decay
@@ -152,14 +167,64 @@ def train_toy_ae(ae: ToyAE, data_sampler, cfg) -> None:
             print(message)
     ae.eval()
     if not ae.bounded:
-        calibration_data = data_sampler(LATENT_NORMALIZATION_SAMPLES)
-        ae.fit_latent_normalization(calibration_data)
+        sampler = calibration_sampler if calibration_sampler is not None else data_sampler
+        ae.fit_latent_normalization(sampler(LATENT_NORMALIZATION_SAMPLES))
 
 
-def make_data_sampler(dataset: str, device: str | torch.device):
+def make_data_sampler(
+    dataset: str,
+    device: str | torch.device,
+    *,
+    seed: int | None = None,
+    stream: str = "train-data",
+):
+    """Data sampler drawing from its own named RNG stream.
+
+    Each stream is a function of ``(seed, stream)`` only, so every arm sees the
+    same data for a given seed no matter what its models consume in between --
+    without this the arms diverge on the first parameter tensor they allocate.
+    Pass ``seed=None`` for an ad-hoc sampler on the global RNG.
+    """
+    generator = (
+        None if seed is None else stream_generator(seed, stream, device=device)
+    )
     if dataset == "8gaussians":
-        return lambda n: sample_8gaussians(n, device)
-    return get_sampler(dataset, device=device)
+        return lambda n: sample_8gaussians(n, device, generator=generator)
+    return get_sampler(dataset, device=device, generator=generator)
+
+
+@dataclass(frozen=True)
+class RunSamplers:
+    """One independent data stream per phase of a run.
+
+    Each phase draws from ``(cfg.seed, phase)`` alone, so what the teacher (say)
+    trains on does not shift because the autoencoder ahead of it ran for a
+    different number of steps, or because another arm's model consumed a
+    different number of draws. That is what makes two arms at the same seed
+    comparable rather than merely reproducible.
+    """
+
+    ae: Callable[[int], torch.Tensor]
+    teacher: Callable[[int], torch.Tensor]
+    student: Callable[[int], torch.Tensor]
+    evaluation: Callable[[int], torch.Tensor]
+    calibration: Callable[[int], torch.Tensor]
+
+
+def make_run_samplers(cfg) -> RunSamplers:
+    """Build the per-phase data streams for one run."""
+    def stream(role: str):
+        return make_data_sampler(
+            cfg.dataset, cfg.device, seed=cfg.seed, stream=f"{role}-data"
+        )
+
+    return RunSamplers(
+        ae=stream("ae"),
+        teacher=stream("teacher"),
+        student=stream("student"),
+        evaluation=stream("evaluation"),
+        calibration=stream("latent-calibration"),
+    )
 
 
 def make_latent_sampler(ae: ToyAE, data_sampler, device: str | torch.device):
@@ -376,6 +441,7 @@ RUN_CONFIG_FIELDS = (
     "tangent_warmup_steps", "tangent_warmup_max",
     "ff_size", "ae_ff_scale", "teacher_ff_scale", "student_ff_scale",
     "ff_input_scale", "latent_reg_weight", "base_std", "ae_weight_decay",
+    "reflow_rounds", "reflow_steps", "reflow_pairs", "reflow_ode_steps",
     "sigma_data", "sigma_min", "sigma_max", "edm_rho", "edm_p_mean", "edm_p_std",
 )
 

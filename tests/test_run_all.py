@@ -43,6 +43,7 @@ def _args(**overrides):
     fields = dict(
         dataset=None, latent_dim=None, ae_steps=None, teacher_steps=None,
         student_steps=None, train_mode=None, ff=None, ae_weight_decay=None,
+        reflow_rounds=None, reflow_steps=None,
         ae_ff_scale=None, teacher_ff_scale=None, student_ff_scale=None,
     )
     unknown = set(overrides) - set(fields)

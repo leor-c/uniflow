@@ -30,6 +30,8 @@ import matplotlib.pyplot as plt
 from core import rf as R
 from core import ayf_rf as A
 from core.autoencoder import freeze
+from core.modules import apply_ff_spec
+from core.seeding import seed_stream, stream_generator
 from mnist.ae import (
     MNISTAutoEncoder,
     train_mnist_ae,
@@ -51,20 +53,41 @@ class Config:
 
     # AE
     latent_dim: int = 64
-    ae_steps: int = 20000
+    ae_steps: int = 60000
     ae_lr: float = 3e-4
+    # AdamW's default weight_decay is 0.01, which was never a deliberate choice
+    # here. Decay on the encoder shrinks its weights, which for the tanh head
+    # pulls pre-activations toward 0 and the latents toward the origin while the
+    # decoder rescales to compensate -- the reconstruction loss is indifferent
+    # to that trade. Leading suspect for the bounded latents sitting at
+    # mean|z| ~ 0.17 against the 0.5 that U([-1,1]) implies. Set 0 to disable.
+    ae_weight_decay: float = 0.01
     ae_batch_size: int = 256
     latent_spread_weight: float = 0
 
     # RF teacher
     hidden: int = 256
     depth: int = 4
-    teacher_steps: int = 30000
+    teacher_steps: int = 80000
     teacher_lr: float = 1e-3
+
+    # --- ReFlow (Liu et al. 2022, "Flow Straight and Fast") -------------------
+    # After the teacher is fit, refit it on its own ODE coupling
+    # ``(z0, ODE(z0))``. 1-RF trains on independent pairs, so paths cross and the
+    # velocity is an average over crossings -- curved, and poorly served by one
+    # Euler step. The coupling does not cross, so each round straightens the
+    # field, which is exactly what 1-step sampling and AYF distillation need.
+    # 0 = plain 1-RF (default), 1 = 2-RF, 2 = 3-RF.
+    reflow_rounds: int = 0
+    reflow_steps: int = 30000
+    reflow_pairs: int = 200000
+    # Accuracy of the coupling. Each round targets the previous ODE rather than
+    # the data, so too few steps here bakes integration error into the teacher.
+    reflow_ode_steps: int = 128
 
     # AYF interval student
     student_lr: float = 1e-3
-    student_steps: int = 20000
+    student_steps: int = 80000
 
     # '+'-joined AYF terms: "emd" | "ct" | "lmd", e.g. "emd+lmd".
     train_mode: str = "emd"
@@ -98,7 +121,10 @@ class Config:
     ff_size: int = 64
     teacher_ff_scale: float | None = None
     student_ff_scale: float | None = None
-    ff_input_scale: float = 1.0
+    # Bounded latents satisfy E[z^2] = 1/3, so their scale is sqrt(1/3) --
+    # matching toy/uniform_rf.py, so one nominal ff_scale means the same
+    # effective frequency here as in the standardized arms.
+    ff_input_scale: float = math.sqrt(1.0 / 3.0)
     time_eps: float = 1e-4
 
     interval_teacher_ode_steps: int = 16
@@ -210,7 +236,21 @@ def main(cfg: Config | None = None):
             choices=["emd", "lmd", "emd+lmd", "ct", "ct+lmd"],
         )
         ap.add_argument("--lmd_weight", type=float, default=None)
+        ap.add_argument(
+            "--ff", default=None,
+            help="Which Fourier sites to enable, as a letter string: T=teacher "
+                 "state, S=student state (e.g. 'TS', 'T'). 'none' disables all. "
+                 "Sites left out are switched OFF.",
+        )
+        ap.add_argument(
+            "--ae_weight_decay", type=float, default=None,
+            help="AdamW weight decay for the autoencoder (default 0.01, AdamW's "
+                 "own default). Pass 0 to train the AE without decay.",
+        )
         ap.add_argument("--out_dir", default="results/mnist/uniform_rf")
+        ap.add_argument("--reflow_rounds", type=int, default=None,
+                        help="ReFlow rounds: 0 = 1-RF (default), 1 = 2-RF.")
+        ap.add_argument("--reflow_steps", type=int, default=None)
         ap.add_argument("--data_root", default="./data")
         args = ap.parse_args()
         cfg = fast_cpu_config() if args.fast else Config()
@@ -223,66 +263,104 @@ def main(cfg: Config | None = None):
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
         cfg.train_mode = args.train_mode
+        if args.ff is not None:
+            apply_ff_spec(cfg, args.ff, allowed=("teacher", "student"))
         if args.lmd_weight is not None:
             cfg.lmd_weight = args.lmd_weight
+        if args.ae_weight_decay is not None:
+            cfg.ae_weight_decay = args.ae_weight_decay
         cfg.out_dir = args.out_dir
+        if args.reflow_rounds is not None:
+            cfg.reflow_rounds = args.reflow_rounds
+        if args.reflow_steps is not None:
+            cfg.reflow_steps = args.reflow_steps
         cfg.data_root = args.data_root
 
     print(cfg)
-    torch.manual_seed(cfg.seed)
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     # --- Data ---
+    # One RNG stream per role, all derived from cfg.seed. A single global
+    # manual_seed makes weight init, data order, training noise and the figure
+    # draws share one stream, so arms with different architectures diverge on
+    # their first parameter tensor and never see the same data again.
     train_loader = make_mnist_data_loader(
-        cfg.data_root, train=True, batch_size=cfg.ae_batch_size
+        cfg.data_root, train=True, batch_size=cfg.ae_batch_size,
+        generator=stream_generator(cfg.seed, "ae-data"),
+    )
+    # Fixed dataset order: the encoded latent matrix and the figure inputs are
+    # then the same rows and the same digits in every arm.
+    ordered_loader = make_mnist_data_loader(
+        cfg.data_root, train=True, batch_size=cfg.ae_batch_size, shuffle=False,
     )
 
     # --- AE ---
+    seed_stream(cfg.seed, "ae-init")
     ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim, bounded=True).to(cfg.device)
     print("\nTraining MNIST autoencoder...")
+    seed_stream(cfg.seed, "ae-train")
     train_mnist_ae(
         ae, train_loader,
         iters=cfg.ae_steps,
         lr=cfg.ae_lr,
         device=cfg.device,
         latent_spread_weight=cfg.latent_spread_weight,
+        weight_decay=cfg.ae_weight_decay,
         log_every=cfg.log_every,
     )
     torch.save(ae.state_dict(), os.path.join(cfg.out_dir, "ae.pt"))
 
     # --- Pre-encode training set ---
     print("\nEncoding training data...")
-    all_latents = encode_dataset(ae, train_loader, cfg.device)
+    all_latents = encode_dataset(ae, ordered_loader, cfg.device)
     print(f"  latents: {all_latents.shape}  "
           f"mean_abs={all_latents.abs().mean():.3f}  "
           f"max_abs={all_latents.abs().max():.3f}")
     freeze(ae)
 
-    latent_sampler = make_mnist_latent_sampler(all_latents, cfg.device)
+    teacher_latents = make_mnist_latent_sampler(
+        all_latents, cfg.device, generator=stream_generator(cfg.seed, "teacher-data")
+    )
+    student_latents = make_mnist_latent_sampler(
+        all_latents, cfg.device, generator=stream_generator(cfg.seed, "student-data")
+    )
 
     # --- RF teacher ---
+    seed_stream(cfg.seed, "teacher-init")
     teacher = R.RFTeacher(
         cfg.latent_dim, cfg.hidden, cfg.depth,
         ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
     print("\nTraining RF teacher in latent space...")
-    R.train_teacher(teacher, latent_sampler, cfg)
+    seed_stream(cfg.seed, "teacher-train")
+    R.train_teacher(teacher, teacher_latents, cfg)
     torch.save(teacher.state_dict(), os.path.join(cfg.out_dir, "teacher.pt"))
 
     # --- AYF interval student ---
+    seed_stream(cfg.seed, "student-init")
     student = A.RFIntervalFlowMap(
         cfg.latent_dim, cfg.hidden, cfg.depth,
         ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
     print(f"\nTraining AYF interval flow map ({cfg.train_mode})...")
-    A.train_student_interval(student, teacher, latent_sampler, cfg)
+    seed_stream(cfg.seed, "student-train")
+    A.train_student_interval(student, teacher, student_latents, cfg)
     torch.save(student.state_dict(), os.path.join(cfg.out_dir, "student.pt"))
 
     # --- Visualise ---
     print("\nGenerating sample plots...")
-    make_plots(ae, teacher, student, cfg, train_loader)
+    seed_stream(cfg.seed, "evaluation")
+    make_plots(ae, teacher, student, cfg, ordered_loader)
+
+    # These arms emit image grids rather than metrics, so nothing else would
+    # record which configuration produced them. Write it alongside the grids.
+    import dataclasses, json
+    config_path = os.path.join(cfg.out_dir, "run_config.json")
+    with open(config_path, "w") as handle:
+        json.dump(dataclasses.asdict(cfg), handle, indent=2, sort_keys=True, default=str)
+    print(f"Saved run config -> {config_path}")
     print(f"\nAll outputs in {cfg.out_dir}/")
 
 

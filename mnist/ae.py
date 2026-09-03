@@ -216,8 +216,16 @@ def make_mnist_data_loader(
     train: bool = True,
     batch_size: int = 256,
     num_workers: int = 2,
+    shuffle: bool = True,
+    generator: torch.Generator | None = None,
 ):
-    """Return a torchvision DataLoader for MNIST (downloads if needed)."""
+    """Return a torchvision DataLoader for MNIST (downloads if needed).
+
+    ``generator`` drives the shuffle, so the batch order is a function of that
+    stream alone rather than of whatever else has drawn from the global RNG.
+    ``shuffle=False`` gives the fixed dataset order, which is what the encoding
+    pass and the figure inputs want: the same digits in every arm and seed.
+    """
     try:
         import torchvision
         import torchvision.transforms as T
@@ -232,7 +240,7 @@ def make_mnist_data_loader(
         transform=T.ToTensor(),
     )
     return torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True,
+        dataset, batch_size=batch_size, shuffle=shuffle, generator=generator,
         num_workers=num_workers, pin_memory=True, drop_last=True,
     )
 
@@ -259,10 +267,15 @@ def encode_dataset(
 def make_mnist_latent_sampler(
     all_latents: torch.Tensor,
     device: str | torch.device,
+    generator: torch.Generator | None = None,
 ):
-    """Returns callable(batch_size) → [B, latent_dim] on device."""
+    """Returns callable(batch_size) → [B, latent_dim] on device.
+
+    Give the teacher and the student separate generators so neither phase's
+    batches depend on how many the other consumed.
+    """
     def sampler(batch_size: int) -> torch.Tensor:
-        idx = torch.randint(0, len(all_latents), (batch_size,))
+        idx = torch.randint(0, len(all_latents), (batch_size,), generator=generator)
         return all_latents[idx].to(device)
     return sampler
 

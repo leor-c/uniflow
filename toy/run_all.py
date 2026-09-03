@@ -88,6 +88,12 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
             # argparse None means "not supplied"; a non-positive value is the
             # explicit way to switch a site off, since Config uses None for that.
             setattr(cfg, f"{site}_ff_scale", value if value > 0.0 else None)
+    # The EDM arm trains a denoiser, not an RF velocity, so it has no reflow
+    # field -- skip it rather than inventing one.
+    for field in ("reflow_rounds", "reflow_steps"):
+        value = getattr(args, field)
+        if value is not None and hasattr(cfg, field):
+            setattr(cfg, field, value)
     if args.ae_weight_decay is not None:
         cfg.ae_weight_decay = args.ae_weight_decay
     if args.ae_steps is not None:
@@ -457,6 +463,13 @@ def main():
         help="AdamW weight decay for the autoencoder in EVERY arm (default 0.01, "
              "AdamW's own default). Pass 0 to train the AEs without decay.",
     )
+    ap.add_argument(
+        "--reflow-rounds", type=int, default=None,
+        help="ReFlow rounds for the RF arms: 0 = plain 1-RF (default), 1 = 2-RF, "
+             "2 = 3-RF. Ignored by the EDM arm, which has no RF velocity.",
+    )
+    ap.add_argument("--reflow-steps", type=int, default=None,
+                    help="Training steps per ReFlow round.")
     ap.add_argument("--ae-steps", type=int, default=None)
     ap.add_argument("--teacher-steps", type=int, default=None)
     ap.add_argument("--student-steps", type=int, default=None)

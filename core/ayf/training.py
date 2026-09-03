@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from ..ayf_rf.training import resolve_train_mode
 from ..rf.models import RFTeacher
+from ..rf.training import train_teacher_reflow
 from ..ayf_rf.models import RFIntervalFlowMap
 from .sampling import sample_noise
 from .losses import (
@@ -56,6 +57,12 @@ def train_teacher_gaussian(
             print(f"[AYF teacher] step {step:05d} | loss {loss.item():.6f}")
 
     teacher.eval()
+    # ReFlow uses this arm's own base, so the coupling matches what the student
+    # will later be distilled against.
+    train_teacher_reflow(
+        teacher, cfg, label="AYF teacher",
+        noise_sampler=lambda b, d, dev: sample_noise(b, d, dev, cfg.base_std),
+    )
 
 
 def train_student_ayf(

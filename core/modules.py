@@ -200,7 +200,7 @@ class MLP(nn.Module):
             d = hidden
         layers.append(nn.Linear(d, out_dim))
         self.net = nn.Sequential(*layers)
-        init_silu_(self, output_layers=(self.net[-1],))
+        # init_silu_(self, output_layers=(self.net[-1],))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
