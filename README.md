@@ -174,12 +174,13 @@ python -m toy.run_all --ff none      # no Fourier features anywhere
 
 On `run_all` it applies uniformly to all three arms, which is what makes the
 ablation controlled; the same flag works on each arm's own entry point. The
-MNIST arms have no encoder-input site, so there `--ff` accepts only `T` and `S`.
+MNIST and CIFAR-10 arms have no encoder-input site, so there `--ff` accepts only
+`T` and `S`.
 
 `--ff` chooses the sites; `--ae-ff-scale` / `--teacher-ff-scale` /
 `--student-ff-scale` set the frequency of a site (and a value of `0` also
-disables one). MNIST leaves all sites off by default, so `--ff` there turns them
-on at the toy-calibrated scales in `DEFAULT_FF_SCALES`.
+disables one). The image arms leave all sites off by default, so `--ff` there
+turns them on at the toy-calibrated scales in `DEFAULT_FF_SCALES`.
 
 ### Distillation objective
 
@@ -320,9 +321,22 @@ Individual arms can be run with `python -m toy.gaussian_rf`,
 `python -m toy.uniform_rf`, or `python -m toy.edm_baseline`.
 All generated figures and JSON metrics are written to `results/`.
 
-The `mnist/` directory contains optional Uniform RF/AYF and EDM extensions.
-They are not part of the reported comparison and require `torchvision` plus a
-separate, substantially longer training run.
+The `mnist/` and `cifar10/` directories contain optional Uniform RF/AYF and EDM
+extensions to image space. They are not part of the reported comparison and
+require `torchvision` plus a separate, substantially longer training run. Both
+packages have the same three arms and the same CLI:
+
+```bash
+python -m mnist.run_all
+python -m cifar10.run_all
+```
+
+`cifar10/` mirrors `mnist/` arm for arm, differing only where the dataset forces
+it to: an 8x8 latent grid instead of 7x7 (so `--patch 2` is also legal there), a
+wider autoencoder over 3-channel inputs, 8 latent planes rather than 4, and RGB
+figure output. Unlike MNIST, unconditional CIFAR-10 FID is widely published, so
+it is the arm where adding a quantitative image metric would give an external
+reference point rather than only a within-repo ranking.
 
 ## Repository layout
 
@@ -332,7 +346,8 @@ core/ayf/      Gaussian-prior AYF objective and sampling
 core/ayf_rf/   uniform-prior, bounded-latent AYF objective and sampling
 core/edm/      EDM teacher, flow-matching wrapper, and consistency reference
 toy/           primary 2D benchmark and runner
-mnist/         optional image-space extension
+mnist/         optional image-space extension (28x28 grayscale)
+cifar10/       optional image-space extension (32x32 RGB), mirrors mnist/
 results/       generated figures and metric summaries
 ```
 
