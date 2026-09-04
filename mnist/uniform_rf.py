@@ -33,6 +33,7 @@ from core.autoencoder import freeze
 from core.modules import apply_ff_spec
 from core.seeding import seed_stream, stream_generator
 from mnist.ae import (
+    LATENT_GRID,
     MNISTAutoEncoder,
     train_mnist_ae,
     make_mnist_data_loader,
@@ -52,7 +53,16 @@ class Config:
     data_root: str = "./data"
 
     # AE
-    latent_dim: int = 64
+    # The latent is a spatial feature map, not a flat vector. The encoder's
+    # conv stack ends at 7x7 and a 1x1 conv head puts ``latent_channels``
+    # feature planes there, so the generative model sees structure it can
+    # actually attend over. ``latent_dim`` is just the flattened size and is
+    # derived from the channel count in __post_init__: everything downstream
+    # (noise samplers, ODE integrators, losses, metrics) keeps operating on
+    # plain ``(B, latent_dim)`` tensors, and only the DiT backbone reshapes
+    # back to ``(C, 7, 7)`` internally.
+    latent_channels: int = 4
+    latent_dim: int = 4 * LATENT_GRID * LATENT_GRID  # derived; see __post_init__
     ae_steps: int = 60000
     ae_lr: float = 3e-4
     # AdamW's default weight_decay is 0.01, which was never a deliberate choice
@@ -68,6 +78,20 @@ class Config:
     # RF teacher
     hidden: int = 256
     depth: int = 4
+
+    # --- Denoiser backbone ----------------------------------------------------
+    # "dit" runs a Diffusion Transformer over the 7x7 latent grid (patch=1 ->
+    # 49 tokens, global attention in every layer); "mlp" is the original flat
+    # FiLM-MLP, kept as an ablation. ``hidden`` and ``depth`` above are the
+    # transformer width and block count when arch="dit".
+    #
+    # A UNet was the other realistic option and was rejected: at a 7x7 grid it
+    # can barely downsample (7 -> 4 -> 2), so its multi-resolution inductive
+    # bias -- the entire reason to prefer one -- buys nothing here.
+    arch: str = "dit"
+    heads: int = 8
+    mlp_ratio: float = 4.0
+    patch: int = 1
     teacher_steps: int = 80000
     teacher_lr: float = 1e-3
 
@@ -140,11 +164,31 @@ class Config:
     log_every: int = 100
     out_dir: str = "results/mnist/uniform_rf"
 
+    def __post_init__(self):
+        # Single source of truth is the channel count; the 7x7 grid is fixed by
+        # the AE's downsampling, so latent_dim is never set independently.
+        self.latent_dim = self.latent_channels * LATENT_GRID * LATENT_GRID
+
+    @property
+    def latent_shape(self) -> tuple[int, int, int]:
+        return (self.latent_channels, LATENT_GRID, LATENT_GRID)
+
+    @property
+    def backbone_kwargs(self) -> dict:
+        """Backbone selection passed verbatim to every model class."""
+        return dict(
+            arch=self.arch,
+            latent_shape=self.latent_shape,
+            heads=self.heads,
+            mlp_ratio=self.mlp_ratio,
+            patch=self.patch,
+        )
+
 
 def fast_cpu_config(**overrides) -> Config:
     """Reduced config for CPU-only runs (~15-25 min instead of 1-2 h)."""
     cfg = Config(
-        latent_dim=64,
+        latent_channels=4,
         hidden=256,
         depth=4,
         ae_steps=2000,
@@ -227,7 +271,11 @@ def main(cfg: Config | None = None):
         ap = argparse.ArgumentParser()
         ap.add_argument("--fast", action="store_true",
                         help="Use reduced config for CPU-only runs (~15-25 min)")
-        ap.add_argument("--latent_dim", type=int, default=None)
+        ap.add_argument("--latent_channels", type=int, default=None,
+                        help="Latent feature planes on the 7x7 grid "
+                             "(latent_dim = channels * 49).")
+        ap.add_argument("--arch", default=None, choices=["dit", "mlp"],
+                        help="Denoiser backbone (default: dit).")
         ap.add_argument("--ae_steps", type=int, default=None)
         ap.add_argument("--teacher_steps", type=int, default=None)
         ap.add_argument("--student_steps", type=int, default=None)
@@ -254,8 +302,11 @@ def main(cfg: Config | None = None):
         ap.add_argument("--data_root", default="./data")
         args = ap.parse_args()
         cfg = fast_cpu_config() if args.fast else Config()
-        if args.latent_dim is not None:
-            cfg.latent_dim = args.latent_dim
+        if args.latent_channels is not None:
+            cfg.latent_channels = args.latent_channels
+            cfg.latent_dim = cfg.latent_channels * LATENT_GRID * LATENT_GRID
+        if args.arch is not None:
+            cfg.arch = args.arch
         if args.ae_steps is not None:
             cfg.ae_steps = args.ae_steps
         if args.teacher_steps is not None:
@@ -296,7 +347,8 @@ def main(cfg: Config | None = None):
 
     # --- AE ---
     seed_stream(cfg.seed, "ae-init")
-    ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim, bounded=True).to(cfg.device)
+    ae = MNISTAutoEncoder(latent_dim=cfg.latent_dim, bounded=True,
+                          latent_channels=cfg.latent_channels).to(cfg.device)
     print("\nTraining MNIST autoencoder...")
     seed_stream(cfg.seed, "ae-train")
     train_mnist_ae(
@@ -331,6 +383,7 @@ def main(cfg: Config | None = None):
         cfg.latent_dim, cfg.hidden, cfg.depth,
         ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
+        **cfg.backbone_kwargs,
     ).to(cfg.device)
     print("\nTraining RF teacher in latent space...")
     seed_stream(cfg.seed, "teacher-train")
@@ -343,6 +396,7 @@ def main(cfg: Config | None = None):
         cfg.latent_dim, cfg.hidden, cfg.depth,
         ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
+        **cfg.backbone_kwargs,
     ).to(cfg.device)
     print(f"\nTraining AYF interval flow map ({cfg.train_mode})...")
     seed_stream(cfg.seed, "student-train")

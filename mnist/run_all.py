@@ -34,6 +34,7 @@ import torch
 
 from core.modules import apply_ff_spec
 from mnist import edm_baseline, gaussian_rf, uniform_rf
+from mnist.ae import LATENT_GRID
 
 
 PIPELINES = ("uniform_rf", "gaussian_rf", "edm_ayf")
@@ -54,8 +55,11 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
     cfg.seed = seed
     if args.data_root is not None:
         cfg.data_root = args.data_root
-    if args.latent_dim is not None:
-        cfg.latent_dim = args.latent_dim
+    if args.latent_channels is not None:
+        cfg.latent_channels = args.latent_channels
+        cfg.latent_dim = cfg.latent_channels * LATENT_GRID * LATENT_GRID
+    if args.arch is not None:
+        cfg.arch = args.arch
     if args.train_mode is not None:
         cfg.train_mode = args.train_mode
     if args.ff is not None:
@@ -135,7 +139,11 @@ def main():
             help=f"Fourier scale for the {_site} state, applied to every arm. "
                  "Omit for the Config default (off for MNIST); 0 disables.",
         )
-    ap.add_argument("--latent-dim", type=int, default=None)
+    ap.add_argument("--latent-channels", type=int, default=None,
+                    help="Latent feature planes on the 7x7 grid "
+                         "(latent_dim = channels * 49).")
+    ap.add_argument("--arch", default=None, choices=["dit", "mlp"],
+                    help="Denoiser backbone for every arm (default: dit).")
     ap.add_argument(
         "--ff", default=None,
         help="Which Fourier sites to enable in EVERY arm, as a letter string: "

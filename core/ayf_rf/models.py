@@ -10,7 +10,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..modules import FourierTimeEmbedding, FiLMMLP, RandomFourierFeatures
+from ..dit import make_backbone
+from ..modules import FourierTimeEmbedding, RandomFourierFeatures
 
 
 class RFIntervalFlowMap(nn.Module):
@@ -30,7 +31,10 @@ class RFIntervalFlowMap(nn.Module):
     def __init__(self, latent_dim: int, hidden: int = 128, depth: int = 4,
                  num_freq: int = 64, max_freq: float = 32.0,
                  ff_scale: float | None = None, ff_size: int = 64,
-                 ff_input_scale: float = 1.0):
+                 ff_input_scale: float = 1.0,
+                 arch: str = "mlp",
+                 latent_shape: tuple[int, int, int] | None = None,
+                 heads: int = 6, mlp_ratio: float = 4.0, patch: int = 1):
         super().__init__()
         self.time_embed = FourierTimeEmbedding(num_freq, max_freq)
         time_dim = 3 * self.time_embed.dim  # emb(t), emb(s), emb(s - t)
@@ -43,7 +47,11 @@ class RFIntervalFlowMap(nn.Module):
             if ff_scale is not None else None
         )
         in_dim = latent_dim if self.state_features is None else self.state_features.dim
-        self.mlp = FiLMMLP(in_dim, time_dim, latent_dim, hidden=hidden, depth=depth)
+        self.mlp = make_backbone(
+            in_dim, time_dim, latent_dim, hidden, depth,
+            arch=arch, latent_shape=latent_shape,
+            heads=heads, mlp_ratio=mlp_ratio, patch=patch,
+        )
 
     def slope(self, z: torch.Tensor, t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Predict the interval slope ``F_theta(z, t, s)`` used by AYF."""

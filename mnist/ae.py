@@ -2,15 +2,31 @@
 Convolutional autoencoder for MNIST (28×28 grayscale → bounded latent space).
 
 Architecture:
-    Encoder: Conv(1→32, 3×3, s=2) → Conv(32→64, 3×3, s=2) → Conv(64→128, 3×3) → Linear → tanh
-    Decoder: Linear → Upsample(2×) → Conv(128→64, 3×3) → Upsample(2×) → Conv(64→32, 3×3)
-             → Conv(32→1, 3×3) → Sigmoid
+    Encoder: Conv(1→32, 3×3, s=2) → Conv(32→64, 3×3, s=2) → Conv(64→128, 3×3)
+             → head → tanh
+    Decoder: head → Upsample(2×) → Conv(128→64, 3×3) → Upsample(2×) → Conv(64→32, 3×3)
+             → Conv(32→1, 3×3)
 
 Decoder uses nearest-neighbour upsample + conv instead of ConvTranspose2d to
 avoid checkerboard artefacts (Odena et al., 2016).
 
-Latent vectors are bounded in (-1, 1)^latent_dim by the encoder tanh, compatible
-with the Uniform[-1,1]^d noise prior used by the Uniform RF arm.
+Latent layout
+-------------
+``latent_channels=None`` gives the original flat latent: the 128×7×7 feature map
+is collapsed by a single Linear into a ``latent_dim`` vector.
+
+``latent_channels=C`` instead keeps the 7×7 grid and uses a 1×1 conv head, so
+the latent is a ``C×7×7`` feature map -- the layout a DiT or UNet denoiser needs
+in order to have any spatial structure to model at all. This is the default for
+the MNIST arms (C=4, i.e. latent_dim=196); see :mod:`core.dit`.
+
+The map is *flattened on the way out* of the encoder, so every consumer of the
+latent (noise samplers, ODE integrators, losses, metrics) keeps working with
+plain ``(B, latent_dim)`` tensors and only the backbone reshapes back to
+``(C, 7, 7)``.
+
+tanh is elementwise either way, so latents are bounded in (-1, 1)^latent_dim and
+stay compatible with the Uniform[-1,1]^d prior used by the Uniform RF arm.
 
 Public API
 ----------
@@ -30,6 +46,11 @@ import torch.nn.functional as F
 from core.modules import init_silu_
 
 
+# The encoder downsamples 28 -> 14 -> 7, so a spatial latent lives on a 7x7
+# grid. Fixed by the conv stack above, not a free parameter.
+LATENT_GRID = 7
+
+
 # ---------------------------------------------------------------------------
 # Architecture
 # ---------------------------------------------------------------------------
@@ -43,9 +64,15 @@ class MNISTEncoder(nn.Module):
         → Flatten → Linear → tanh
     """
 
-    def __init__(self, latent_dim: int = 64, bounded: bool = True):
+    def __init__(
+        self,
+        latent_dim: int = 64,
+        bounded: bool = True,
+        latent_channels: int | None = None,
+    ):
         super().__init__()
         self.bounded = bounded
+        self.latent_channels = latent_channels
         self.net = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=1, stride=1, padding=0),
             nn.SiLU(),
@@ -56,13 +83,32 @@ class MNISTEncoder(nn.Module):
             nn.Conv2d(64,  128, kernel_size=3, stride=1, padding=1),  # 7→7
             nn.SiLU(),
         )
-        self.head = nn.Linear(128 * 7 * 7, latent_dim)
+        if latent_channels is None:
+            # Flat latent: collapse the whole feature map through one Linear.
+            self.head = nn.Linear(128 * 7 * 7, latent_dim)
+        else:
+            # Spatial latent: a 1x1 conv keeps the 7x7 grid, so the generative
+            # model downstream sees a feature map rather than an unstructured
+            # vector. Flattened on the way out so every consumer of the latent
+            # (noise samplers, ODE integrators, losses, metrics) keeps working
+            # on plain (B, latent_dim) tensors.
+            if latent_dim != latent_channels * LATENT_GRID * LATENT_GRID:
+                raise ValueError(
+                    f"latent_dim {latent_dim} does not match "
+                    f"{latent_channels}x{LATENT_GRID}x{LATENT_GRID}"
+                )
+            self.head = nn.Conv2d(128, latent_channels, kernel_size=1)
         init_silu_(self, output_layers=(self.head,))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Raw encoder output; the tanh boundary applies only to bounded latents."""
-        h = self.net(x).flatten(1)
-        z = self.head(h)
+        h = self.net(x)
+        if self.latent_channels is None:
+            z = self.head(h.flatten(1))
+        else:
+            z = self.head(h).flatten(1)
+        # tanh is elementwise, so a spatial latent is bounded per latent pixel
+        # and the uniform arm's base stays i.i.d. U([-1, 1]) over all d dims.
         return torch.tanh(z) if self.bounded else z
 
 
@@ -77,9 +123,14 @@ class MNISTDecoder(nn.Module):
         → Conv(3×3) → (1, 28, 28) → Sigmoid
     """
 
-    def __init__(self, latent_dim: int = 64):
+    def __init__(self, latent_dim: int = 64, latent_channels: int | None = None):
         super().__init__()
-        self.proj = nn.Linear(latent_dim, 128 * 7 * 7)
+        self.latent_channels = latent_channels
+        if latent_channels is None:
+            self.proj = nn.Linear(latent_dim, 128 * 7 * 7)
+        else:
+            # Mirror of the encoder's 1x1 conv head.
+            self.proj = nn.Conv2d(latent_channels, 128, kernel_size=1)
         self.net = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="nearest"),          # 7→14
             nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
@@ -94,7 +145,11 @@ class MNISTDecoder(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.proj(z).view(-1, 128, 7, 7)
+        if self.latent_channels is None:
+            h = self.proj(z).view(-1, 128, 7, 7)
+        else:
+            grid = z.view(-1, self.latent_channels, LATENT_GRID, LATENT_GRID)
+            h = self.proj(grid)
         return self.net(h)
 
 
@@ -109,14 +164,28 @@ class MNISTAutoEncoder(nn.Module):
     and EDM arms both use that form.
     """
 
-    def __init__(self, latent_dim: int = 64, bounded: bool = True):
+    def __init__(
+        self,
+        latent_dim: int = 64,
+        bounded: bool = True,
+        latent_channels: int | None = None,
+    ):
         super().__init__()
-        self.encoder = MNISTEncoder(latent_dim, bounded=bounded)
-        self.decoder = MNISTDecoder(latent_dim)
+        self.encoder = MNISTEncoder(latent_dim, bounded=bounded,
+                                    latent_channels=latent_channels)
+        self.decoder = MNISTDecoder(latent_dim, latent_channels=latent_channels)
         self.latent_dim = latent_dim
+        self.latent_channels = latent_channels
         self.bounded = bounded
         self.register_buffer("latent_mean", torch.zeros(latent_dim))
         self.register_buffer("latent_std", torch.ones(latent_dim))
+
+    @property
+    def latent_shape(self) -> tuple[int, int, int] | None:
+        """``(C, H, W)`` for a spatial latent, ``None`` for a flat one."""
+        if self.latent_channels is None:
+            return None
+        return (self.latent_channels, LATENT_GRID, LATENT_GRID)
 
     def raw_latent(self, x: torch.Tensor) -> torch.Tensor:
         """Encoder output before standardization (already tanh'd if bounded)."""

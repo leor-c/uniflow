@@ -5,7 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..modules import FourierTimeEmbedding, FiLMMLP, RandomFourierFeatures
+from ..dit import make_backbone
+from ..modules import FourierTimeEmbedding, RandomFourierFeatures
 
 
 class EDMPrecondDenoiser(nn.Module):
@@ -31,6 +32,11 @@ class EDMPrecondDenoiser(nn.Module):
             max_freq: float = 32.0,
             ff_scale: float | None = None,
             ff_size: int = 64,
+            arch: str = "mlp",
+            latent_shape: tuple[int, int, int] | None = None,
+            heads: int = 6,
+            mlp_ratio: float = 4.0,
+            patch: int = 1,
     ):
         super().__init__()
         self.sigma_data = float(sigma_data)
@@ -42,7 +48,11 @@ class EDMPrecondDenoiser(nn.Module):
             if ff_scale is not None else None
         )
         in_dim = latent_dim if self.state_features is None else self.state_features.dim
-        self.mlp = FiLMMLP(in_dim, self.noise_embed.dim, latent_dim, hidden=hidden, depth=depth)
+        self.mlp = make_backbone(
+            in_dim, self.noise_embed.dim, latent_dim, hidden, depth,
+            arch=arch, latent_shape=latent_shape,
+            heads=heads, mlp_ratio=mlp_ratio, patch=patch,
+        )
 
     def forward(self, z: torch.Tensor, log_sigma: torch.Tensor) -> torch.Tensor:
         if log_sigma.ndim == 1:
@@ -92,6 +102,11 @@ class EDMConsistencyModel(EDMPrecondDenoiser):
             sigma_min: float = 0.002,
             num_freq: int = 64,
             max_freq: float = 32.0,
+            arch: str = "mlp",
+            latent_shape: tuple[int, int, int] | None = None,
+            heads: int = 6,
+            mlp_ratio: float = 4.0,
+            patch: int = 1,
     ):
         super().__init__(
             latent_dim=latent_dim,
@@ -100,6 +115,11 @@ class EDMConsistencyModel(EDMPrecondDenoiser):
             sigma_data=sigma_data,
             num_freq=num_freq,
             max_freq=max_freq,
+            arch=arch,
+            latent_shape=latent_shape,
+            heads=heads,
+            mlp_ratio=mlp_ratio,
+            patch=patch,
         )
         self.sigma_min = float(sigma_min)
 
