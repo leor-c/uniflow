@@ -17,6 +17,21 @@ class FourierTimeEmbedding(nn.Module):
     Deliberately avoids the 2^k frequency schedule used in NeRF / transformers.
     The JVP / consistency losses differentiate through this embedding, so large
     frequencies create extremely stiff gradients w.r.t. t and destabilise training.
+
+    ``deriv_cap`` bounds the time-derivative of each ``sin``/``cos`` pair, *not* of
+    the embedding as a whole. Each pair contributes ``amp_i^2 * omega_i^2`` to the
+    squared total, so with ``amp_i = deriv_cap / omega_i``
+
+        ||d emb/dt|| = deriv_cap * sqrt(num_frequencies),
+
+    which at the 64 frequencies these models use is 8x the nominal cap: 16 against
+    an ``||emb||`` of only 0.5. Callers that are *differentiated through in t* must
+    therefore scale ``deriv_cap`` by ``1/sqrt(num_frequencies)`` to get the bound
+    the name implies -- :class:`core.ayf_rf.models.RFIntervalFlowMap` does exactly
+    that, and needs it (see its docstring). Callers that only ever evaluate the
+    embedding, such as :class:`core.rf.models.RFTeacher`, are unaffected by the
+    stiffness and keep the plain per-component cap, which preserves the time
+    resolution they need.
     """
 
     def __init__(self, num_frequencies: int = 4, max_freq: float = 4.0, log_scale: bool = False, deriv_cap: float = 2.0):

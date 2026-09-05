@@ -227,6 +227,49 @@ Autoguidance and the guidance-weight conditioning `lambda` in Algorithm 1 are
 also absent, which is immaterial here because this benchmark has no
 classifier-free guidance.
 
+### Time-embedding stiffness in the flow map (fixed)
+
+AYF stabilizes the EMD tangent by setting `c_noise(t) = t`, and identifies
+`d_t F_theta` as the dominant source of instability in it. `FourierTimeEmbedding`
+takes the equivalent precaution through its `deriv_cap`, but that knob caps the
+time-derivative of *each* `sin`/`cos` pair rather than of the embedding as a
+whole. Since
+
+    ||d emb/dt||^2 = sum_i amp_i^2 * omega_i^2,
+
+the aggregate is `deriv_cap * sqrt(num_frequencies)` — at the 64 frequencies
+these models use, `||d emb/dt|| ~ 16` against `||emb|| ~ 0.5`.
+
+That is harmless for a network the losses only *evaluate*, and fatal for one they
+differentiate in `t`. The measured AYF tangent `dF/dt` was **99.8% `d_t F`** (the
+transport term `J_z F . v` was ~0.038), so once the tangent warmup `r` reached its
+cap the map-consistency term ran 1.5–3.4x the flow-matching term anchoring it and
+`cos(g, fm)` fell from 0.999 to ~0.35. On the CIFAR-10 seed shipped here the
+student blew up within 250 steps of the cap — `eval endpoint` 0.014 (step 1750) →
+0.027 (2000) → **0.368** (2250) — and never recovered, ending as the identity
+map: one-step MSE against the teacher ODE 0.224, versus 0.234 for
+`C(z,0,1) = z`. It is seed-dependent, so some runs pass through untouched;
+MNIST's saved student failed the same way.
+
+`RFIntervalFlowMap` now scales its `deriv_cap` by `1/sqrt(num_freq)`, so the flow
+map's time embedding obeys the nominal bound. On the same failing seed the
+student reaches a one-step MSE of **0.0070** on CIFAR-10 (32x better) and
+**0.0168** on MNIST (19x better), and both produce recognizable images in a
+single step.
+
+The fix is deliberately confined to the student. The teacher is only ever
+evaluated inside the AYF losses — `v = teacher(z_t, t)` runs under `no_grad`, and
+the JVP is taken through `student.slope` alone — so it is never differentiated in
+`t` and gains nothing from a softer embedding. Softening it as well measurably
+*costs* time resolution: on the 2D benchmark it moved teacher target NLL by
++0.09 (uniform) and +0.21 (Gaussian) nats. Note that `freqs` and `amp` are
+registered buffers, so a teacher restored from a checkpoint keeps whatever
+embedding it was trained with regardless of this setting.
+
+The paper's own warmup horizon (`tangent_warmup_steps = 10000` rather than 2000)
+fixes the same seed independently (one-step MSE 0.0095); the two together are no
+better than either alone, so only this one is applied.
+
 
 ## Results
 
