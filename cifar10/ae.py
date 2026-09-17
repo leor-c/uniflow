@@ -2,8 +2,8 @@
 Convolutional autoencoder for CIFAR-10 (32×32 RGB → bounded latent space).
 
 Mirror of :mod:`mnist.ae`. Same architecture family, same latent contract, same
-public API; the three things that actually differ from MNIST are called out
-below, because everything else in this file is deliberately identical.
+public API. The architectural differences are called out below; training also
+adds a frozen VGG LPIPS perceptual loss to the pixel MSE.
 
 Architecture:
     Encoder: Conv(3→32, 1×1) → Conv(32→64, 3×3, s=2) → Conv(64→128, 3×3, s=2)
@@ -51,13 +51,15 @@ stay compatible with the Uniform[-1,1]^d prior used by the Uniform RF arm.
 Public API
 ----------
     CIFAR10AutoEncoder            – full AE
-    train_cifar10_ae              – training loop (MSE reconstruction loss)
+    train_cifar10_ae              – training loop (MSE + LPIPS reconstruction)
     encode_dataset                – pre-encode entire dataset → latent tensor
     make_cifar10_latent_sampler   – fast random sampler over pre-encoded latents
     make_cifar10_data_loader      – torchvision DataLoader for CIFAR-10
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -166,7 +168,7 @@ class CIFAR10Decoder(nn.Module):
             nn.SiLU(),
             nn.Conv2d(32, IMAGE_CHANNELS, kernel_size=1, stride=1, padding=0),
             # Output is left unbounded, as in mnist.ae: the reconstruction loss
-            # is MSE against pixels in [0, 1] and the figure code clamps.
+            # includes MSE against pixels in [0, 1]. LPIPS and figures clamp.
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -258,15 +260,35 @@ def train_cifar10_ae(
     latent_spread_weight: float = 1e-3,
     weight_decay: float = 0.01,
     log_every: int = 500,
+    lpips_weight: float = 0.1,
 ) -> None:
     """
     Train the CIFAR-10 AE.
 
-    Reconstruction loss: mean squared error on pixels.
+    Reconstruction loss: pixel MSE + ``lpips_weight`` * mean VGG LPIPS.
+    LPIPS sees reconstructions clamped to [0, 1], then both images scaled to
+    [-1, 1]. MSE uses the raw decoder output, retaining gradients outside the
+    pixel range. Frozen VGG features support native 32x32 images. Pretrained
+    weights download on first use; set ``lpips_weight=0`` for MSE-only training
+    without importing LPIPS or loading its weights.
 
     Regularisation: mild per-dim second-moment penalty encouraging the latent
-distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
+    distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
     """
+    if not math.isfinite(lpips_weight) or lpips_weight < 0:
+        raise ValueError("lpips_weight must be finite and non-negative")
+    perceptual_loss = None
+    if lpips_weight > 0:
+        try:
+            import lpips
+        except ImportError as e:
+            raise ImportError(
+                "lpips is required for perceptual CIFAR-10 AE training. "
+                "Install with: pip install '.[cifar10]' or set lpips_weight=0."
+            ) from e
+        perceptual_loss = lpips.LPIPS(net="vgg").to(device).eval()
+        perceptual_loss.requires_grad_(False)
+
     ae.to(device)
     ae.train()
     opt = torch.optim.AdamW(ae.parameters(), lr=lr, weight_decay=weight_decay)
@@ -281,6 +303,12 @@ distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
 
         recon = F.mse_loss(x_hat, x)
         loss = recon
+        perceptual = x.new_zeros(())
+        if perceptual_loss is not None:
+            perceptual = perceptual_loss(
+                x_hat.clamp(0, 1) * 2 - 1, x * 2 - 1,
+            ).mean()
+            loss = loss + lpips_weight * perceptual
 
         if ae.bounded and latent_spread_weight > 0:
             mean_pen = z.mean(dim=0).pow(2).mean()
@@ -291,7 +319,8 @@ distribution to use the full [-1,1]^d box (mean→0, variance→1/3).
         opt.step()
 
         if step % log_every == 0 or step == iters:
-            print(f"[cifar10 ae] step {step:05d} | mse {recon.item():.4f}")
+            print(f"[cifar10 ae] step {step:05d} | mse {recon.item():.4f}"
+                  f" | lpips {perceptual.item():.4f} | loss {loss.item():.4f}")
 
     ae.eval()
     if not ae.bounded:

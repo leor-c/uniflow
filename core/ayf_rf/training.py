@@ -11,9 +11,12 @@ The RF teacher is trained separately with ``core.rf.train_teacher``.
 
 from __future__ import annotations
 
+from copy import copy
 from typing import Callable
 
 import torch
+
+from ..lr_schedule import make_lr_scheduler
 
 from ..rf import RFTeacher
 from .models import RFIntervalFlowMap
@@ -78,11 +81,12 @@ def resolve_train_mode(cfg, *, allow_ct: bool = False) -> frozenset[str]:
     return terms
 
 
-def train_student_interval(
+def _train_student_interval_phase(
     student: RFIntervalFlowMap,
     teacher: RFTeacher,
     latent_sampler: Callable[[int], torch.Tensor],
     cfg,
+    step_offset: int = 0,
 ) -> None:
     """
     Train the AYF-style interval flow map.
@@ -104,6 +108,7 @@ def train_student_interval(
     teacher.eval()
     terms = resolve_train_mode(cfg, allow_ct=True)
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.student_lr)
+    scheduler = make_lr_scheduler(opt, cfg, "student")
 
     warmup_steps = getattr(cfg, "tangent_warmup_steps", 0)
     warmup_max = getattr(cfg, "tangent_warmup_max", 0.99)
@@ -113,7 +118,7 @@ def train_student_interval(
         # (s-t)dF/dt term, so training starts as flow matching and eases the
         # map-consistency term in. warmup_steps = 0 disables it (r = 1).
         r = (1.0 if warmup_steps <= 0
-             else min(warmup_max, (step - 1) / float(warmup_steps)))
+             else min(warmup_max, (step_offset + step - 1) / float(warmup_steps)))
         loss = torch.zeros((), device=cfg.device)
         loss_emd = None
         loss_lmd = None
@@ -173,6 +178,8 @@ def train_student_interval(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if step % cfg.log_every == 0:
             ep = ayf_endpoint_eval_loss(
@@ -203,3 +210,30 @@ def train_student_interval(
             print(msg)
 
     student.eval()
+
+
+def train_student_interval(
+    student: RFIntervalFlowMap,
+    teacher: RFTeacher,
+    latent_sampler: Callable[[int], torch.Tensor],
+    cfg,
+) -> None:
+    """Train the interval map with an optional, separately counted refinement.
+
+    AdamW is restarted for refinement, while tangent warmup continues from the
+    initial phase. No teacher parameters are updated by either student phase.
+    """
+    refine_steps = getattr(cfg, "student_refine_steps", 0)
+    refine_lr = getattr(cfg, "student_refine_lr", 1e-4)
+    if refine_steps < 0 or (refine_steps and refine_lr <= 0):
+        raise ValueError("Student refinement needs nonnegative steps and a positive LR")
+    _train_student_interval_phase(student, teacher, latent_sampler, cfg)
+    if refine_steps:
+        print(f"\nRefining AYF student: {refine_steps} steps at LR {refine_lr:g}")
+        refined = copy(cfg)
+        refined.student_steps = refine_steps
+        refined.student_lr = refine_lr
+        refined.student_lr_drop_step = None
+        _train_student_interval_phase(
+            student, teacher, latent_sampler, refined, step_offset=cfg.student_steps
+        )

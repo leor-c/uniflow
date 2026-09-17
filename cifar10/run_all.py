@@ -81,6 +81,8 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
             setattr(cfg, field, value)
     if args.ae_weight_decay is not None:
         cfg.ae_weight_decay = args.ae_weight_decay
+    if args.ae_lpips_weight is not None:
+        cfg.ae_lpips_weight = args.ae_lpips_weight
     if args.ae_steps is not None:
         cfg.ae_steps = args.ae_steps
     if args.teacher_steps is not None:
@@ -171,6 +173,11 @@ def main():
     ap.add_argument("--reflow-steps", type=int, default=None,
                     help="Training steps per ReFlow round.")
     ap.add_argument("--ae-steps", type=int, default=None)
+    ap.add_argument(
+        "--ae-lpips-weight", type=float, default=None,
+        help="VGG LPIPS weight in AE reconstruction for every arm "
+             "(default 0.1; 0 disables).",
+    )
     ap.add_argument("--teacher-steps", type=int, default=None)
     ap.add_argument("--student-steps", type=int, default=None)
     ap.add_argument("--data-root", default=None)

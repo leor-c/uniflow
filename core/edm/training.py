@@ -14,6 +14,8 @@ from typing import Callable
 
 import torch
 
+from ..lr_schedule import make_lr_scheduler
+
 from .models import EDMConsistencyModel, EDMPrecondDenoiser
 from .losses import (
     edm_teacher_loss,
@@ -34,6 +36,7 @@ def train_edm_teacher(
     """
     denoiser.train()
     opt = torch.optim.AdamW(denoiser.parameters(), lr=cfg.edm_teacher_lr)
+    scheduler = make_lr_scheduler(opt, cfg, "teacher")
     for step in range(1, cfg.edm_teacher_steps + 1):
         loss = edm_teacher_loss(
             denoiser, latent_sampler, cfg.batch_size, cfg.device,
@@ -43,6 +46,8 @@ def train_edm_teacher(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
         if step % cfg.log_every == 0:
             print(f"[edm teacher] step {step:05d} | loss {loss.item():.6f}")
     denoiser.eval()

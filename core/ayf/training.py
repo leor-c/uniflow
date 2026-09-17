@@ -16,6 +16,8 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
+
+from ..lr_schedule import make_lr_scheduler
 import torch.nn.functional as F
 
 from ..ayf_rf.training import resolve_train_mode
@@ -39,6 +41,7 @@ def train_teacher_gaussian(
     """Train the RF teacher with Gaussian noise ``z0 ~ N(0, base_std² I)``."""
     teacher.train()
     opt = torch.optim.AdamW(teacher.parameters(), lr=cfg.teacher_lr)
+    scheduler = make_lr_scheduler(opt, cfg, "teacher")
 
     for step in range(1, cfg.teacher_steps + 1):
         with torch.no_grad():
@@ -52,6 +55,8 @@ def train_teacher_gaussian(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if step % cfg.log_every == 0:
             print(f"[AYF teacher] step {step:05d} | loss {loss.item():.6f}")
@@ -75,6 +80,7 @@ def train_student_ayf(
     teacher.eval()
     terms = resolve_train_mode(cfg)
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.student_lr)
+    scheduler = make_lr_scheduler(opt, cfg, "student")
 
     warmup_steps = getattr(cfg, "tangent_warmup_steps", 0)
     warmup_max = getattr(cfg, "tangent_warmup_max", 0.99)
@@ -118,6 +124,8 @@ def train_student_ayf(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if step % cfg.log_every == 0:
             ep = ayf_endpoint_eval_loss(

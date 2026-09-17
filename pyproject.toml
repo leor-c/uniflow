@@ -13,7 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 # Both image-space extensions pull their datasets through torchvision.
 mnist = ["torchvision>=0.15"]
-cifar10 = ["torchvision>=0.15"]
+cifar10 = ["torchvision>=0.15", "lpips>=0.1.4"]
 
 [build-system]
 requires = ["setuptools>=68"]

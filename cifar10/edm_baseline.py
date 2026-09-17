@@ -72,6 +72,7 @@ class Config:
     # to that trade. Leading suspect for the bounded latents sitting at
     # mean|z| ~ 0.17 against the 0.5 that U([-1,1]) implies. Set 0 to disable.
     ae_weight_decay: float = 0.01
+    ae_lpips_weight: float = 0.1
     ae_batch_size: int = 256
     latent_spread_weight: float = 1e-3
 
@@ -284,6 +285,10 @@ def main(cfg: Config | None = None):
                         help="DiT patch size over the 8x8 grid: 1 (64 tokens, "
                              "default) or 2 (16 tokens, cheaper).")
         ap.add_argument("--ae_steps", type=int, default=None)
+        ap.add_argument(
+            "--ae-lpips-weight", "--ae_lpips_weight", type=float, default=None,
+            help="VGG LPIPS weight in AE reconstruction (default 0.1; 0 disables).",
+        )
         ap.add_argument("--teacher_steps", type=int, default=None)
         ap.add_argument("--student_steps", type=int, default=None)
         ap.add_argument(
@@ -314,6 +319,8 @@ def main(cfg: Config | None = None):
             cfg.arch = args.arch
         if args.patch is not None:
             cfg.patch = args.patch
+        if args.ae_lpips_weight is not None:
+            cfg.ae_lpips_weight = args.ae_lpips_weight
         if args.ae_steps is not None:
             cfg.ae_steps = args.ae_steps
         if args.teacher_steps is not None:
@@ -361,6 +368,7 @@ def main(cfg: Config | None = None):
         device=cfg.device,
         latent_spread_weight=cfg.latent_spread_weight,
         weight_decay=cfg.ae_weight_decay,
+        lpips_weight=cfg.ae_lpips_weight,
         log_every=cfg.log_every,
     )
     torch.save(ae.state_dict(), os.path.join(cfg.out_dir, "ae.pt"))

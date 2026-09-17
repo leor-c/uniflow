@@ -22,6 +22,8 @@ from core.rf import RFTeacher
 from core import ayf as A
 from core.modules import apply_ff_spec
 from core.seeding import seed_stream
+from toy.outputs import configure_outputs, save_run_config
+from toy.lr_schedule import add_lr_arguments, apply_lr_overrides
 from toy.common import (
     ToyAE,
     evaluate_density_outputs,
@@ -99,6 +101,8 @@ class Config:
     depth: int = 4
     teacher_steps: int = 80_000
     teacher_lr: float = 1e-3
+    teacher_lr_drop_step: int | None = 40_000
+    teacher_final_lr: float = 1e-4
 
     # --- ReFlow (Liu et al. 2022, "Flow Straight and Fast") -------------------
     # After the teacher is fit, refit it on its own ODE coupling
@@ -116,6 +120,8 @@ class Config:
 
     # AYF student for the Gaussian RF teacher
     student_lr: float = 1e-3
+    student_lr_drop_step: int | None = 40_000
+    student_final_lr: float = 1e-4
     student_steps: int = 80_000
     # '+'-joined AYF terms: "emd" | "lmd" | "emd+lmd". The weights only set the
     # mix of the terms the mode enables, so lmd_weight is inert without "lmd".
@@ -146,8 +152,9 @@ class Config:
 
     log_every: int = 500
     save_figure: bool = True
-    out: str = "results/gaussian_rf_{}.png"
-    metrics_out: str = "results/gaussian_rf_{}.json"
+    out_dir: str | None = None
+    out: str | None = None
+    metrics_out: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +163,7 @@ class Config:
 
 @torch.no_grad()
 def make_plot(ae: ToyAE, teacher, student, eval_sampler, cfg: Config):
+    configure_outputs(cfg, "gaussian_rf")
     n = 5000
 
     data = eval_sampler(n).cpu()
@@ -273,14 +281,18 @@ def main(cfg: Config | None = None):
         ap.add_argument("--reflow-steps", type=int, default=None,
                         help="Training steps per ReFlow round.")
         ap.add_argument("--seed", type=int, default=1)
+        ap.add_argument("--out-dir", default=None,
+                        help="Run directory; default: results/toy/<dataset>/<baseline>/seed_<seed>.")
         ap.add_argument("--out", default=None)
+        add_lr_arguments(ap)
         args = ap.parse_args()
         cfg = Config(
             dataset=args.dataset,
             base_std=args.base_std,
             train_mode=args.train_mode,
             seed=args.seed,
-            out=args.out or f"results/gaussian_rf_{args.dataset}.png",
+            out=args.out,
+            out_dir=args.out_dir,
         )
         if args.teacher_steps is not None:
             cfg.teacher_steps = args.teacher_steps
@@ -307,6 +319,10 @@ def main(cfg: Config | None = None):
         if args.latent_dim is not None:
             cfg.latent_dim = args.latent_dim
 
+        apply_lr_overrides(cfg, args, teacher_lr_field="teacher_lr")
+
+    configure_outputs(cfg, "gaussian_rf")
+    save_run_config(cfg)
     print(cfg)
     # One RNG stream per role, all derived from cfg.seed. A single global
     # manual_seed makes every consumer -- weight init, data, training noise,

@@ -9,6 +9,7 @@ runs/
 !results/
 !results/*.png
 !results/*.json
+!results/toy/**/*.png
 .DS_Store
 metrics.md
 build/

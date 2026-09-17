@@ -1,4 +1,5 @@
 torch>=2.0
 torchvision>=0.15
+lpips>=0.1.4
 matplotlib>=3.5
 POT>=0.9.6

@@ -28,12 +28,15 @@ import torch
 
 from core.modules import apply_ff_spec
 from toy import edm_baseline, gaussian_rf, uniform_rf
+from toy.outputs import RESULTS_ROOT, run_directory
+from toy.lr_schedule import add_lr_arguments, apply_lr_overrides
 from toy.common import (
     BENCHMARK_PROTOCOL,
     DENSITY_PROTOCOL,
     DENSITY_SAMPLES,
     TARGET_NOISE_SCALES,
     save_metrics,
+    run_config_record,
 )
 
 
@@ -102,22 +105,23 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
         setattr(cfg, teacher_field, args.teacher_steps)
     if args.student_steps is not None:
         setattr(cfg, student_field, args.student_steps)
+    apply_lr_overrides(cfg, args, teacher_lr_field=teacher_field.replace("_steps", "_lr"))
     return cfg
 
 
 def _seed_metrics_path(pipeline: str, dataset: str, seed: int) -> Path:
-    return Path("results/seeds") / f"{pipeline}_{dataset}_seed{seed}.json"
+    return run_directory(dataset, pipeline, seed) / "metrics.json"
 
 
 def _seed_metrics_pattern(pipeline: str, seed: int) -> str:
-    return str(Path("results/seeds") / f"{pipeline}_{{}}_seed{seed}.json")
+    return str(_seed_metrics_path(pipeline, "{}", seed))
 
 
 def _configure_multi_seed_outputs(cfg, pipeline: str, seed: int, args) -> None:
     cfg.metrics_out = _seed_metrics_pattern(pipeline, seed)
     cfg.save_figure = args.plot_all_seeds or seed == args.plot_seed
-    if cfg.save_figure:
-        cfg.out = str(Path("results") / f"{pipeline}_{{}}-seed-{seed}.png")
+    cfg.out_dir = str(run_directory(cfg.dataset, pipeline, seed))
+    cfg.out = str(Path(cfg.out_dir) / "samples.png")
 
 
 def _has_current_metric_schema(metrics: dict) -> bool:
@@ -129,7 +133,7 @@ def _has_current_metric_schema(metrics: dict) -> bool:
     )
 
 
-def _load_seed_metrics(dataset: str, seed: int):
+def _load_seed_metrics(dataset: str, seed: int, args=None):
     paths = {
         pipeline: _seed_metrics_path(pipeline, dataset, seed)
         for pipeline in PIPELINES
@@ -142,6 +146,17 @@ def _load_seed_metrics(dataset: str, seed: int):
     }
     if not _has_current_metric_schema(metrics):
         return None
+    # Protocol alone cannot distinguish current runs with different LR/step
+    # overrides. Compare all recorded result-determining settings as well.
+    for pipeline, (module, teacher_field, student_field) in PIPELINE_MODULES.items():
+        cfg = module.Config(dataset=dataset, seed=seed)
+        if args is not None:
+            _apply_overrides(cfg, args, seed, teacher_field=teacher_field,
+                             student_field=student_field)
+        expected = run_config_record(cfg)
+        saved = metrics[pipeline].get("run_config", {})
+        if any(key not in saved or saved[key] != value for key, value in expected.items()):
+            return None
     return metrics
 
 
@@ -291,7 +306,7 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
             "",
             "## Aggregate comparison",
             "",
-            f"![Aggregate target-NLL comparison](summary_{dataset}.png)",
+            "![Aggregate target-NLL comparison](summary.png)",
             "",
             "Bars show means, error bars show ± one sample standard deviation, and points show individual seeds.",
             "",
@@ -317,7 +332,7 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
             "- These five-seed results are descriptive; overlapping standard deviations "
             "should not be interpreted as statistically significant differences.",
             "",
-            f"Raw aggregate and per-seed values: [`summary_{dataset}.json`](summary_{dataset}.json).",
+            "Raw aggregate and per-seed values: [`summary.json`](summary.json).",
             "",
         ]
     )
@@ -325,7 +340,7 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
 
 
 def _save_markdown_summary(summary: dict, dataset: str) -> Path:
-    path = Path("results") / f"summary_{dataset}.md"
+    path = RESULTS_ROOT / dataset / "summary.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_render_markdown_summary(summary, dataset))
     print(f"Saved Markdown report -> {path}")
@@ -398,7 +413,7 @@ def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
     ax.legend(frameon=False, loc="best")
     fig.tight_layout()
 
-    path = Path("results") / f"summary_{dataset}.png"
+    path = RESULTS_ROOT / dataset / "summary.png"
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
@@ -473,6 +488,7 @@ def main():
     ap.add_argument("--ae-steps", type=int, default=None)
     ap.add_argument("--teacher-steps", type=int, default=None)
     ap.add_argument("--student-steps", type=int, default=None)
+    add_lr_arguments(ap)
     args = ap.parse_args()
     if args.plot_all_seeds and args.resume:
         ap.error(
@@ -498,7 +514,7 @@ def main():
     all_metrics = {}
     pending_seeds = []
     for seed in seeds:
-        metrics = _load_seed_metrics(dataset, seed) if multi_seed and args.resume else None
+        metrics = _load_seed_metrics(dataset, seed, args) if multi_seed and args.resume else None
         if metrics is not None:
             print(f"Reusing complete metrics for seed {seed}")
             all_metrics[seed] = metrics
@@ -536,7 +552,7 @@ def main():
 
     aggregate = _aggregate(all_metrics)
     summary = aggregate if multi_seed else all_metrics[seeds[0]]
-    save_metrics(summary, f"results/summary_{dataset}.json")
+    save_metrics(summary, str(RESULTS_ROOT / dataset / "summary.json"))
     _save_aggregate_plot(aggregate, dataset)
     _save_markdown_summary(aggregate, dataset)
 

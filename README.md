@@ -2,7 +2,7 @@
 
 Diffusion and flow models predominantly use Gaussian noise, which requires rescaling the latents to match its fixed unit scale.
 
-This repo studies an alternative: uniform noise on [-1, 1] paired with tanh-bounded latents (a tanh applied to the encoder output). The supports coincide by construction, so there's nothing to rescale, and the bounded space can be enforced at generation time.
+This repo studies an alternative: uniform noise on [-1, 1] paired with tanh-bounded latents (a tanh applied to the encoder output). The latents lie inside the noise cube without post-training rescaling. This does not guarantee that the encoder covers the whole cube or that its latent density is uniform; the flow still has to learn that density.
 
 The study uses 1-Rectified Flow (RF) and compares the standard Gaussian noise baseline against the uniform noise variant, with an EDM baseline included for reference. It also evaluates Align Your Flow (AYF) distillation, training an AYF student for each baseline.
 
@@ -22,9 +22,11 @@ unbounded autoencoder for reconstruction only, followed by a fixed post-training
 latent rescaling: the latents are centred and divided by a *single global
 scalar*, following latent-diffusion practice, so the transform is a similarity
 and the latent geometry reaches the generative model undistorted. Uniform RF
-adds the encoder's final `tanh` and a weak
-moment penalty (weight $10^{-3}$) that targets the mean and second moment of
-$\mathcal U([-1,1])$; its latents are not post-training standardized.
+adds the encoder's final `tanh` and trains on reconstruction alone as well; its
+latents need no post-training rescaling, because the `tanh` already places them
+in the cube its base distribution occupies. All three arms therefore fit their
+autoencoder to reconstruction and nothing else, which is what keeps the
+comparison controlled.
 
 ## Method
 
@@ -89,9 +91,10 @@ Three settings determine what this benchmark measures, and they are coupled.
 
 ### Latent dimension
 
-`latent_dim = 2`, matching the data dimension. This is the only setting in
-which the study's premise is testable: the latent is full-dimensional, so the
-bounded arm's tanh latents and its `U([-1,1]^d)` base genuinely share a support.
+`latent_dim = 2`, matching the data dimension. This avoids forcing the target
+onto a lower-dimensional manifold. The bounded latents can be full-dimensional,
+but equality with the support of `U([-1,1]^d)` also requires the encoder to cover
+the cube; dimension preservation and `tanh` alone do not establish that.
 
 Any larger value is an *expansion*. A 2D data manifold placed in a 32-cube
 occupies zero volume of the support it nominally shares, so "the supports
@@ -100,17 +103,6 @@ however many dimensions are supplied. Expansion also flatters every arm: the
 spare directions are ones the decoder was never trained to move along, so it
 contracts student error that points into them, and one-step samples look
 better than the flow map actually is.
-
-### Autoencoder latent regularizer
-
-`latent_reg_weight = 0` for the uniform arm. At `latent_dim = 2` the moment
-penalty changes one-step results by less than the seed spread, so all three arms
-now train their autoencoder on reconstruction alone and the comparison is
-controlled.
-
-It is **not** optional at larger `latent_dim`. Without it the encoder collapses
-coordinates (`E[z^2]` falls to ~0.09 against the uniform target of 1/3) and the
-teacher itself fails, so raise it if you raise `latent_dim`.
 
 ### Fourier features
 
@@ -140,7 +132,7 @@ Three independent sites, each `None` to disable:
 
 | config field | encodes | notes |
 |---|---|---|
-| `ae_ff_scale` | the 2D input `x`, before the encoder | shapes the latent itself; substitutes for the moment regularizer |
+| `ae_ff_scale` | the 2D input `x`, before the encoder | shapes the latent itself |
 | `teacher_ff_scale` | the teacher's state | for EDM this is the *preconditioned* input `c_in z`, unit scale at every sigma |
 | `student_ff_scale` | the AYF student's state | differentiated through by the EMD/LMD tangent (`J_z C`) |
 
@@ -182,11 +174,62 @@ MNIST and CIFAR-10 arms have no encoder-input site, so there `--ff` accepts only
 disables one). The image arms leave all sites off by default, so `--ff` there
 turns them on at the toy-calibrated scales in `DEFAULT_FF_SCALES`.
 
+### CIFAR-10 autoencoder loss
+
+All three CIFAR-10 arms train the AE with pixel MSE plus `0.1 * LPIPS`, using
+frozen pretrained VGG features at the native 32×32 resolution. Install the
+image dependencies with `pip install '.[cifar10]'`; the pretrained VGG weights
+download on first use.
+
+Set `--ae-lpips-weight` on `cifar10.run_all` or an individual arm to tune the
+perceptual term; `0` restores MSE-only reconstruction without loading LPIPS.
+The corresponding Config field is `ae_lpips_weight`. Training logs show MSE,
+unweighted LPIPS, and total loss separately. MSE uses the raw decoder output;
+LPIPS uses clamped reconstructions with both images scaled to `[-1, 1]`.
+
+```bash
+python -m cifar10.run_all --ae-lpips-weight 0.1
+```
+
+### ReFlow (off by default)
+
+`reflow_rounds` refits the RF teacher on its own ODE coupling `(z0, ODE(z0))`
+after the first fit, following Liu et al. 2022. 1-RF trains on *independent*
+endpoint pairs, so the marginal paths cross and the learned velocity is an
+average over those crossings -- curved, and poorly served by a single Euler
+step. The ODE coupling does not cross by construction, so each round straightens
+the field, which is what one-step sampling and AYF distillation want.
+
+`0` is plain 1-RF and the default everywhere, so it does not affect any reported
+number; `1` gives 2-RF, `2` gives 3-RF. Weights carry over between rounds rather
+than being reinitialized, which is what makes a round cheap next to the first
+fit. `reflow_steps` sets the steps per round, `reflow_pairs` the size of the
+regenerated coupling, and `reflow_ode_steps` the integration accuracy used to
+build it -- each round targets the *previous* ODE rather than the data, so a
+coarse integration bakes its error into the teacher, and fidelity error
+accumulates across rounds while straightness improves.
+
+```bash
+python -m toy.run_all --reflow-rounds 1 --reflow-steps 20000
+```
+
+The EDM arm trains a denoiser rather than an RF velocity, so it has no ReFlow
+stage and both runners skip it there. Note the flag is spelled `--reflow-rounds`
+on `run_all` and on the toy arms, but `--reflow_rounds` on the MNIST and
+CIFAR-10 arms' own entry points.
+
 ### Distillation objective
 
 `train_mode` selects the AYF objective: `emd`, `lmd`, or `emd+lmd` (plus `ct`,
 the teacher-free variant, in the uniform arm). `emd_weight` and `lmd_weight` set
 the mix and only apply to the terms the mode enables.
+
+The uniform arm carries two further terms, both weight `0` by default and so
+inert in everything reported here: `pairwise_anchor_weight` regresses the map
+onto the sampled RF chord, `C(z_t,t,s) ~= (1-s)z0 + s z1`, and
+`teacher_interval_anchor_weight` regresses it onto the integrated teacher,
+`C(z_t,t,s) ~= Phi_teacher(t -> s)(z_t)`. The second integrates the teacher
+every batch, so it is a debugging anchor rather than a training default.
 
 Align Your Flow's ablation reports that "AYF-LMD significantly outperforms
 AYF-EMD" on a 2D toy dataset, and that "the trend reverses on image datasets,
@@ -201,9 +244,19 @@ weights, the loss is applied to the slope `F` rather than the full map
 `C = z + (s-t)F` (using `C` multiplies the gradient by `s-t` and suppresses the
 short intervals that carry the flow-matching signal), and the tangent warmup
 `r = min(0.99, iters/H)` scales only the `(s-t) dF/dt` term, so training begins
-as pure flow matching and eases the map-consistency term in. `H` defaults to
-2000 here rather than the paper's 10k, because these runs are 10k student steps
-in total.
+as pure flow matching and eases the map-consistency term in.
+
+`H = 2000` in every arm, against the paper's 10000, and the measurement is what
+picks it. The warmup anchors the student for an absolute number of steps rather
+than a fraction of the run -- what matters is that the velocity model is usable
+before the map-consistency term reaches full weight -- so the same value applies
+whether an arm trains its student for 20k steps or 80k. A longer horizon buys
+nothing once the flow map's time embedding is bounded: on the CIFAR-10 seed that
+used to diverge, `H = 2000` reaches a one-step MSE of 0.0070 against the teacher
+ODE and `H = 10000` reaches 0.0095, and setting both is no better than either
+alone. The two are alternative fixes for the same instability, and the embedding
+bound is the one that addresses its cause; see
+[Time-embedding stiffness](#time-embedding-stiffness-in-the-flow-map-fixed).
 
 ### Known deviations from the paper
 
@@ -267,20 +320,40 @@ registered buffers, so a teacher restored from a checkpoint keeps whatever
 embedding it was trained with regardless of this setting.
 
 The paper's own warmup horizon (`tangent_warmup_steps = 10000` rather than 2000)
-fixes the same seed independently (one-step MSE 0.0095); the two together are no
-better than either alone, so only this one is applied.
+fixes the same seed independently, to a one-step MSE of 0.0095. It is the weaker
+of the two -- it delays the unbounded tangent rather than bounding it -- and
+stacking it on top of the embedding fix gains nothing, so `H` stays at 2000; see
+[Distillation objective](#distillation-objective).
 
 
 ## Results
 
-The default 8-Gaussians benchmark uses 2-dimensional latents, 20k
-AE steps, 10k teacher steps, 10k student steps, and batch size 64. Each seed
-generates 5,000 evaluation samples and evaluates 2,048 uniformly sampled points
-with three complementary density diagnostics: generated-sample NLL under the
-known target density (fidelity), held-out target NLL under a generated-sample
-KDE (coverage), and the fraction beyond a three-noise-scale tube around the
-clean modes or arcs. Results are the mean ± sample standard deviation across
-seeds; lower is better. Figures use seed 1 as a
+The seed-1 uniform teacher's distorted blobs were investigated with controlled
+sampling and learning-rate ablations. A low-LR finishing phase substantially
+improves teacher and AYF fidelity; see the [diagnosis and reproduction commands](results/toy/8gaussians/uniform_rf/experiments/diagnosis_seed_1/REPORT.md).
+The default now uses the matched schedule below (benchmark protocol v7).
+The existing figures and metrics are historical v6 results, not measurements of
+the new defaults; `--resume` will reject them and require fresh runs.
+
+The default toy benchmark uses 2-dimensional latents, 40k AE steps, and batch
+size 64. **Every teacher and AYF student**, including EDM, trains for 80k updates:
+40k at `1e-3`, then 40k at `1e-4`. AdamW's state and student tangent warmup
+continue across the rate drop. AE training remains at its existing 40k/`1e-3`
+setting for all arms.
+
+`--teacher-steps` and `--student-steps` specify total updates; the defaults do not
+append a separate refinement phase. Short smoke runs therefore stay short.
+All individual arms and `toy.run_all` accept `--teacher-lr`, `--teacher-final-lr`,
+`--teacher-lr-drop-step` and the corresponding student flags. For example,
+`--teacher-lr-drop-step -1` disables the teacher's rate drop. Optional uniform-arm
+`--*-refine-steps` still explicitly adds a separate finishing phase.
+
+Each seed generates 5,000 evaluation samples and evaluates 2,048
+uniformly sampled points with three complementary density diagnostics:
+generated-sample NLL under the known target density (fidelity), held-out target
+NLL under a generated-sample KDE (coverage), and the fraction beyond a
+three-noise-scale tube around the clean modes or arcs. Results are the mean ±
+sample standard deviation across seeds; lower is better. Figures use seed 1 as a
 qualitative example and contain the target data, AE reconstruction, teacher ODE
 samples, and one- and eight-step students.
 
@@ -296,15 +369,15 @@ The following panels are seed 1 examples from that archived benchmark run.
 
 **Gaussian RF + AYF**
 
-![Gaussian RF and AYF samples](results/gaussian_rf_8gaussians-seed-1.png)
+![Gaussian RF and AYF samples](results/toy/8gaussians/gaussian_rf/seed_1/samples.png)
 
 **Uniform RF + AYF (uniform noise + tanh latents)**
 
-![Uniform RF and AYF samples](results/uniform_rf_8gaussians-seed-1.png)
+![Uniform RF and AYF samples](results/toy/8gaussians/uniform_rf/seed_1/samples.png)
 
 **EDM**
 
-![EDM teacher and consistency-student samples](results/edm_ayf_8gaussians-seed-1.png)
+![EDM teacher and consistency-student samples](results/toy/8gaussians/edm_ayf/seed_1/samples.png)
 
 ## Reproduce
 
@@ -331,12 +404,12 @@ To continue an interrupted run, reuse completed seed files with:
 python -m toy.run_all --resume
 ```
 
-Raw per-seed metrics are written to `results/seeds/`; the aggregate, including
+Raw per-seed metrics are written to `results/toy/<dataset>/<baseline>/seed_<n>/metrics.json`; the aggregate, including
 all individual values and the sample standard deviation, is written to
-`results/summary_8gaussians.json` and a Markdown table is written to
-`results/summary_8gaussians.md`. A corresponding grouped bar chart with
+`results/toy/8gaussians/summary.json` and a Markdown table is written to
+`results/toy/8gaussians/summary.md`. A corresponding grouped bar chart with
 per-seed points and sample-standard-deviation error bars is written to
-`results/summary_8gaussians.png`. `--resume` reuses completed seed files.
+`results/toy/8gaussians/summary.png`. `--resume` reuses completed seed files.
 
 To generate qualitative figures for every seed, rerun with:
 
@@ -344,25 +417,49 @@ To generate qualitative figures for every seed, rerun with:
 python -m toy.run_all --plot-all-seeds
 ```
 
-This writes filenames such as `gaussian_rf_8gaussians-seed-3.png`. Because the
-toy benchmark does not save model checkpoints, `--resume` cannot generate a
+This writes figures such as `results/toy/8gaussians/gaussian_rf/seed_3/samples.png`.
+Because the multi-arm runner does not save model checkpoints, `--resume` cannot generate a
 missing figure from an already completed run.
 
 For a quick pipeline check:
 
 ```bash
-python -m toy.run_all --seed 1 --ae_steps 10 --teacher_steps 10 --student_steps 10
+python -m toy.run_all --seed 1 --ae-steps 10 --teacher-steps 10 --student-steps 10
 ```
 
 Set one shared autoencoder latent dimension across all three benchmark arms with:
 
 ```bash
-python -m toy.run_all --latent_dim 8
+python -m toy.run_all --latent-dim 8
 ```
 
 Individual arms can be run with `python -m toy.gaussian_rf`,
 `python -m toy.uniform_rf`, or `python -m toy.edm_baseline`.
-All generated figures and JSON metrics are written to `results/`.
+All toy runs use the same layout, whether launched individually or through
+`toy.run_all`:
+
+```text
+results/toy/<dataset>/
+  summary.json / summary.md / summary.png
+  <baseline>/
+    seed_<n>/
+      run_config.json
+      metrics.json
+      metrics.pt          # evaluation samples, not model weights
+      samples.png
+      samples_latent.png  # when latent_dim == 2
+    experiments/         # named ablations and diagnostics
+    legacy_default/      # older unsuffixed runs, kept separately
+    archive/pre_init_fix/
+```
+
+Use `--out-dir <directory>` on an individual arm for a named experiment. Existing
+`--out` filename overrides remain supported; metrics default to a sibling JSON.
+The uniform arm also accepts `--checkpoint-out <path>` for model weights.
+The legacy artifacts have been moved without overwriting existing files; the
+move manifest is `results/toy/migration_manifest.json`. The idempotent migration
+utility can preview any remaining legacy files with `python -m toy.migrate_results`
+and move them with `--apply`. MNIST and CIFAR outputs are unchanged.
 
 The `mnist/` and `cifar10/` directories contain optional Uniform RF/AYF and EDM
 extensions to image space. They are not part of the reported comparison and
@@ -391,6 +488,7 @@ core/edm/      EDM teacher, flow-matching wrapper, and consistency reference
 toy/           primary 2D benchmark and runner
 mnist/         optional image-space extension (28x28 grayscale)
 cifar10/       optional image-space extension (32x32 RGB), mirrors mnist/
+tests/         unit tests for the shared objectives and utilities
 results/       generated figures and metric summaries
 ```
 

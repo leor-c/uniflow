@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -20,6 +21,8 @@ from core import rf as R
 from core import ayf_rf as A
 from core.modules import apply_ff_spec
 from core.seeding import seed_stream
+from toy.outputs import configure_outputs, save_run_config
+from toy.lr_schedule import add_lr_arguments, apply_lr_overrides
 from toy.common import (
     ToyAE,
     evaluate_density_outputs,
@@ -47,8 +50,9 @@ class Config:
 
     # AE
     # The 2D benchmark is dimension-preserving at latent_dim=2: the latent is
-    # full-dimensional, so the bounded/uniform arm's supports genuinely
-    # coincide. Larger values are an expansion, where a 2D manifold sits in a
+    # potentially full-dimensional. Tanh puts it inside the base cube, but
+    # does not guarantee that the encoder covers that cube. Larger values are
+    # an expansion, where a 2D manifold sits in a
     # much bigger space and the extra directions absorb student error.
     latent_dim: int = 2
     hidden: int = 256
@@ -79,7 +83,7 @@ class Config:
     # teacher itself fails, so raise it if you increase latent_dim.
     latent_reg_weight: float = 0.0
 
-    # --- Fourier features (off by default) -----------------------------------
+    # --- Fourier features ----------------------------------------------------
     # Random Fourier encodings of the coordinate inputs. A plain MLP on a
     # low-dimensional input cannot represent the near-discontinuous velocity at
     # the basin boundaries between modes, which strands mass between them; this
@@ -93,7 +97,7 @@ class Config:
     ae_ff_scale: float | None = 0.5 * math.sqrt(2.0)
     teacher_ff_scale: float | None = math.sqrt(2.0 / 3.0)
     student_ff_scale: float | None = math.sqrt(2.0 / 3.0)
-    # Bounded latents satisfy E[z^2] = 1/3, so their scale is sqrt(1/3).
+    # The uniform BASE has E[z^2] = 1/3. Bounded encoded data need not share it.
     ff_input_scale: float = math.sqrt(1.0 / 3.0)
 
 
@@ -101,6 +105,11 @@ class Config:
     depth: int = 4
     teacher_steps: int = 80_000
     teacher_lr: float = 1e-3
+    teacher_lr_drop_step: int | None = 40_000
+    teacher_final_lr: float = 1e-4
+    # Optional low-LR finishing phase, counted in addition to teacher_steps.
+    teacher_refine_steps: int = 0
+    teacher_refine_lr: float = 1e-4
 
     # --- ReFlow (Liu et al. 2022, "Flow Straight and Fast") -------------------
     # After the teacher is fit, refit it on its own ODE coupling
@@ -118,7 +127,11 @@ class Config:
 
     # AYF interval student
     student_lr: float = 1e-3
+    student_lr_drop_step: int | None = 40_000
+    student_final_lr: float = 1e-4
     student_steps: int = 80_000
+    student_refine_steps: int = 0
+    student_refine_lr: float = 1e-4
 
     # '+'-joined AYF terms: "emd" (teacher-based) | "ct" (teacher-free) | "lmd".
     # e.g. "emd", "lmd", "emd+lmd", "ct+lmd". The weights only set the mix of
@@ -155,8 +168,10 @@ class Config:
 
     log_every: int = 500
     save_figure: bool = True
-    out: str = "results/uniform_rf_{}.png"
-    metrics_out: str = "results/uniform_rf_{}.json"
+    out_dir: str | None = None
+    out: str | None = None
+    metrics_out: str | None = None
+    checkpoint_out: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +180,7 @@ class Config:
 
 @torch.no_grad()
 def make_plot(ae: ToyAE, teacher, student, eval_sampler, cfg: Config):
+    configure_outputs(cfg, "uniform_rf")
     n = 5000
     data = eval_sampler(n).cpu()
 
@@ -173,10 +189,14 @@ def make_plot(ae: ToyAE, teacher, student, eval_sampler, cfg: Config):
 
     teacher_z = R.sample_teacher_latents(
         teacher, n, cfg.latent_dim, cfg.device, steps=cfg.teacher_sample_steps
-    ).clamp(-1, 1)
+    )
+    if cfg.sample_clamp:
+        teacher_z = teacher_z.clamp(-1, 1)
     teacher_samples = ae.decode(teacher_z).cpu()
 
-    s1_z = A.sample_student_latents_one_step(student, n, cfg.latent_dim, cfg.device).clamp(-1, 1)
+    s1_z = A.sample_student_latents_one_step(student, n, cfg.latent_dim, cfg.device)
+    if cfg.sample_clamp:
+        s1_z = s1_z.clamp(-1, 1)
     s1 = ae.decode(s1_z).cpu()
 
     sk_z = A.sample_student_latents_k_step(
@@ -237,6 +257,17 @@ def main(cfg: Config | None = None):
         ap.add_argument("--latent-dim", type=int, default=None)
         ap.add_argument("--teacher-steps", type=int, default=None)
         ap.add_argument("--student-steps", type=int, default=None)
+        for role in ("teacher", "student"):
+            ap.add_argument(f"--{role}-refine-steps", type=int, default=0,
+                            help="Additional updates at the refinement learning rate.")
+            ap.add_argument(f"--{role}-refine-lr", type=float, default=1e-4)
+        ap.add_argument("--teacher-sample-steps", type=int, default=256)
+        ap.add_argument("--no-sample-clamp", action="store_true",
+                        help="Disable latent clipping for all three generated panels.")
+        ap.add_argument("--checkpoint-out", default=None,
+                        help="Save AE, teacher, student state dicts and full run config.")
+        ap.add_argument("--metrics-out", default=None)
+        ap.add_argument("--log-every", type=int, default=500)
         ap.add_argument(
             "--train-mode", default="lmd",
             choices=["emd", "lmd", "emd+lmd", "ct", "ct+lmd"],
@@ -279,13 +310,26 @@ def main(cfg: Config | None = None):
         ap.add_argument("--reflow-steps", type=int, default=None,
                         help="Training steps per ReFlow round.")
         ap.add_argument("--seed", type=int, default=1)
+        ap.add_argument("--out-dir", default=None,
+                        help="Run directory; default: results/toy/<dataset>/<baseline>/seed_<seed>.")
         ap.add_argument("--out", default=None)
+        add_lr_arguments(ap)
         args = ap.parse_args()
         cfg = Config(
             dataset=args.dataset,
             train_mode=args.train_mode,
             seed=args.seed,
-            out=args.out or f"results/uniform_rf_{args.dataset}.png",
+            out=args.out,
+            out_dir=args.out_dir,
+            metrics_out=args.metrics_out,
+            teacher_refine_steps=args.teacher_refine_steps,
+            teacher_refine_lr=args.teacher_refine_lr,
+            student_refine_steps=args.student_refine_steps,
+            student_refine_lr=args.student_refine_lr,
+            teacher_sample_steps=args.teacher_sample_steps,
+            sample_clamp=not args.no_sample_clamp,
+            checkpoint_out=args.checkpoint_out,
+            log_every=args.log_every,
         )
         if args.teacher_steps is not None:
             cfg.teacher_steps = args.teacher_steps
@@ -314,6 +358,24 @@ def main(cfg: Config | None = None):
         if args.latent_dim is not None:
             cfg.latent_dim = args.latent_dim
 
+        apply_lr_overrides(cfg, args, teacher_lr_field="teacher_lr")
+
+    configure_outputs(cfg, "uniform_rf")
+    if cfg.teacher_sample_steps < 1 or cfg.log_every < 1:
+        raise ValueError("teacher_sample_steps and log_every must be positive")
+    for role in ("teacher", "student"):
+        steps = getattr(cfg, f"{role}_refine_steps")
+        lr = getattr(cfg, f"{role}_refine_lr")
+        if steps < 0 or (steps and lr <= 0):
+            raise ValueError(f"{role} refinement needs nonnegative steps and a positive LR")
+    checkpoint_path = (
+        Path(cfg.checkpoint_out.format(cfg.dataset)) if cfg.checkpoint_out else None
+    )
+    if checkpoint_path is not None:
+        samples_path = Path(cfg.metrics_out.format(cfg.dataset)).with_suffix(".pt")
+        if checkpoint_path.resolve() == samples_path.resolve():
+            raise ValueError("Model checkpoint must differ from evaluation-sample .pt path")
+    save_run_config(cfg)
     print(cfg)
     # One RNG stream per role, all derived from cfg.seed. A single global
     # manual_seed makes every consumer -- weight init, data, training noise,
@@ -360,6 +422,16 @@ def main(cfg: Config | None = None):
     print(f"\nTraining AYF interval flow map ({cfg.train_mode})...")
     seed_stream(cfg.seed, "student-train")
     A.train_student_interval(student, teacher, student_latents, cfg)
+
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "run_config": asdict(cfg),
+            "ae": ae.state_dict(),
+            "teacher": teacher.state_dict(),
+            "student": student.state_dict(),
+        }, checkpoint_path)
+        print(f"Saved model checkpoint -> {checkpoint_path}")
 
     print("\nPlotting...")
     seed_stream(cfg.seed, "evaluation")

@@ -19,11 +19,9 @@ from toy.datasets import get_sampler
 
 DENSITY_SAMPLES = 2048
 DENSITY_PROTOCOL = "exact-target-nll-kde-coverage-three-sigma-support-v1"
-# v6 split the run into named RNG streams (see core.seeding). Before it, the
-# arms shared one global stream and were trained and evaluated on different
-# data at the same seed, so v5 numbers are not comparable with v6 ones -- the
-# bump is what makes ``run_all --resume`` refuse to reuse them.
-BENCHMARK_PROTOCOL = "global-scalar-latent-scale-edm-flow-matching-ayf-v6"
+# v7 gives every teacher/student the same 80k-update budget and 40k LR drop.
+# Old constant-LR results (including the 20k EDM student) must not be resumed.
+BENCHMARK_PROTOCOL = "global-scalar-latent-scale-edm-flow-matching-ayf-v7"
 LATENT_NORMALIZATION_SAMPLES = 4096
 TARGET_NOISE_SCALES = {
     "8gaussians": 0.035,
@@ -442,6 +440,14 @@ RUN_CONFIG_FIELDS = (
     "ff_size", "ae_ff_scale", "teacher_ff_scale", "student_ff_scale",
     "ff_input_scale", "latent_reg_weight", "base_std", "ae_weight_decay",
     "reflow_rounds", "reflow_steps", "reflow_pairs", "reflow_ode_steps",
+    "ae_lr", "teacher_lr", "student_lr", "edm_teacher_lr",
+    "teacher_lr_drop_step", "teacher_final_lr",
+    "student_lr_drop_step", "student_final_lr",
+    "teacher_refine_steps", "teacher_refine_lr",
+    "student_refine_steps", "student_refine_lr",
+    "teacher_sample_steps", "eval_teacher_ode_steps", "interval_teacher_ode_steps",
+    "sample_k", "sample_schedule", "sample_clamp", "log_every",
+    "pairwise_anchor_weight", "teacher_interval_anchor_weight",
     "sigma_data", "sigma_min", "sigma_max", "edm_rho", "edm_p_mean", "edm_p_std",
 )
 

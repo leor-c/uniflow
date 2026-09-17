@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import copy
 
 import torch
+
+from ..lr_schedule import make_lr_scheduler
 
 import torch.nn.functional as F
 
@@ -13,7 +16,7 @@ from .models import RFTeacher
 from .sampling import NoiseSampler, sample_uniform_noise, integrate_teacher_to_data
 
 
-def train_teacher(
+def _train_teacher_phase(
     teacher: RFTeacher,
     latent_sampler: Callable[[int], torch.Tensor],
     cfg,
@@ -23,6 +26,7 @@ def train_teacher(
     """Train an RF teacher using the base distribution supplied by the caller."""
     teacher.train()
     opt = torch.optim.AdamW(teacher.parameters(), lr=cfg.teacher_lr)
+    scheduler = make_lr_scheduler(opt, cfg, "teacher")
     for step in range(1, cfg.teacher_steps + 1):
         loss = rf_teacher_loss(
             teacher,
@@ -35,9 +39,39 @@ def train_teacher(
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
         if step % cfg.log_every == 0:
             print(f"[{label}] step {step:05d} | loss {loss.item():.6f}")
     teacher.eval()
+
+
+def train_teacher(
+    teacher: RFTeacher,
+    latent_sampler: Callable[[int], torch.Tensor],
+    cfg,
+    noise_sampler: NoiseSampler = sample_uniform_noise,
+    label: str = "RF teacher",
+) -> None:
+    """Fit RF, optionally refine at a lower LR, then apply any ReFlow rounds.
+
+    Refinement resets AdamW's moments and adds ``teacher_refine_steps`` updates
+    at ``teacher_refine_lr``. It is opt-in; existing configurations are unchanged.
+    It must precede ReFlow, whose objective uses a different coupling.
+    """
+    refine_steps = getattr(cfg, "teacher_refine_steps", 0)
+    refine_lr = getattr(cfg, "teacher_refine_lr", 1e-4)
+    if refine_steps < 0 or (refine_steps and refine_lr <= 0):
+        raise ValueError("Teacher refinement needs nonnegative steps and a positive LR")
+    _train_teacher_phase(teacher, latent_sampler, cfg, noise_sampler, label)
+    if refine_steps:
+        refined = copy(cfg)
+        refined.teacher_steps = refine_steps
+        refined.teacher_lr = refine_lr
+        refined.teacher_lr_drop_step = None
+        _train_teacher_phase(
+            teacher, latent_sampler, refined, noise_sampler, f"{label} refinement"
+        )
     train_teacher_reflow(teacher, cfg, noise_sampler=noise_sampler, label=label)
 
 
