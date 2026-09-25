@@ -1,13 +1,13 @@
 """
 Run the three CIFAR-10 benchmark arms: Uniform RF + AYF, Gaussian RF + AYF,
-and EDM + AYF. Mirrors ``mnist.run_all`` for the RGB extension.
+and EDM + AYF.
 
 Each arm uses its own default Config. The --latent-channels, --ae-steps,
 --teacher-steps, --student-steps and --train-mode flags are applied on top of
 those defaults only when explicitly passed; any flag left unset keeps each
 arm's own default for that field.
 
-Like ``mnist.run_all`` and unlike ``toy.run_all`` this script does not aggregate
+Unlike ``toy.run_all``, this script does not aggregate
 metrics, write summary tables, or support --resume. The image arms produce
 grids rather than density metrics, so there is nothing to aggregate: comparison
 here is visual, by looking at the grids in each arm's output directory. Adding a

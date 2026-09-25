@@ -17,6 +17,7 @@ Public API
 ----------
 Models (models.py):
     RFIntervalFlowMap  – interval consistency map C(z, t, s) -> z_s
+    VelocityView       – an interval map's s=1 slope, with the RFTeacher signature
 
 Losses (losses.py; differentiable, return scalar unless noted):
     ayf_emd_loss                     – teacher-based source-time JVP (EMD)
@@ -29,6 +30,8 @@ Losses (losses.py; differentiable, return scalar unless noted):
 
 Training (training.py):
     train_student_interval
+    train_map_teacher  – fit an interval map AS the RF teacher, so teacher and
+                         student share one class and every weight copies
 
 Sampling (sampling.py; return latent tensors, no decoding):
     sample_ayf_time_pair    – source/target time pair 0 <= t < s <= 1
@@ -38,7 +41,7 @@ Sampling (sampling.py; return latent tensors, no decoding):
     sample_student_latents_k_step  – true interval stepping z_{t_i} -> z_{t_{i+1}}
 """
 
-from .models import RFIntervalFlowMap
+from .models import RFIntervalFlowMap, VelocityView
 from .sampling import (
     sample_ayf_time_pair,
     integrate_teacher_interval,
@@ -55,10 +58,11 @@ from .losses import (
     ayf_endpoint_eval_loss,
     ayf_interval_eval_loss,
 )
-from .training import train_student_interval
+from .training import train_student_interval, train_map_teacher
 
 __all__ = [
     "RFIntervalFlowMap",
+    "VelocityView",
     "sample_ayf_time_pair",
     "integrate_teacher_interval",
     "integrate_teacher_to_data",
@@ -72,4 +76,5 @@ __all__ = [
     "ayf_endpoint_eval_loss",
     "ayf_interval_eval_loss",
     "train_student_interval",
+    "train_map_teacher",
 ]

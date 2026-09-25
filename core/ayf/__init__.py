@@ -14,6 +14,8 @@ Public API
 ----------
 Models (from core.ayf_rf):
     RFIntervalFlowMap
+    VelocityView
+    train_map_teacher
 
 Sampling (sampling.py):
     sample_noise                    – z0 ~ N(0, base_std² I)
@@ -35,7 +37,12 @@ Training (training.py):
     train_student_ayf
 """
 
-from ..ayf_rf.models import RFIntervalFlowMap
+from ..ayf_rf.models import RFIntervalFlowMap, VelocityView
+# The map-teacher recipe is prior-agnostic: the base distribution enters only
+# through the noise sampler the caller passes, exactly as train_teacher_gaussian
+# passes one to the shared RF loop. Re-exported so the Gaussian arm reaches it
+# the same way it reaches the shared student model.
+from ..ayf_rf.training import train_map_teacher
 from .sampling import (
     sample_noise,
     sample_ayf_time_pair,
@@ -55,6 +62,8 @@ from .training import train_teacher_gaussian, train_student_ayf
 
 __all__ = [
     "RFIntervalFlowMap",
+    "VelocityView",
+    "train_map_teacher",
     "sample_noise",
     "sample_ayf_time_pair",
     "integrate_teacher_interval",

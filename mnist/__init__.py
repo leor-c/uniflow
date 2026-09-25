@@ -1,1 +1,0 @@
-# MNIST experiments for RF-sCM and EDM baseline.

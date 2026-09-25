@@ -106,6 +106,19 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
     if args.student_steps is not None:
         setattr(cfg, student_field, args.student_steps)
     apply_lr_overrides(cfg, args, teacher_lr_field=teacher_field.replace("_steps", "_lr"))
+    # The shared-architecture teacher initializes the student from the teacher's
+    # weights, which only the two RF arms can do -- the EDM arm's teacher is a
+    # denoiser, not a velocity field with the student's architecture. Enabling
+    # it for some arms and not others would make this benchmark a comparison of
+    # student initializations rather than of base distributions, so the
+    # cross-arm runner refuses it outright. Single-arm studies reach it through
+    # `python -m toy.uniform_rf --shared-teacher`.
+    if getattr(cfg, "shared_teacher", False):
+        raise ValueError(
+            "shared_teacher is enabled on a cross-arm benchmark run. The EDM "
+            "arm cannot honor it, so the arms would no longer share a "
+            "methodology. Run the arms individually if that is what you want."
+        )
     return cfg
 
 
@@ -308,8 +321,7 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
             "",
             "![Aggregate target-NLL comparison](summary.png)",
             "",
-            "Bars show means, error bars show ± one sample standard deviation, and points show individual seeds.",
-            "",
+
             "## Observations",
             "",
         ]
@@ -403,11 +415,8 @@ def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
             )
 
     dataset_title = dataset.replace("8gaussians", "8-Gaussians").replace("_", " ")
-    ax.set_title(
-        f"{dataset_title}: target NLL across {summary['num_seeds']} seeds\n"
-        "bars = mean, error bars = sample standard deviation, points = seeds"
-    )
-    ax.set_ylabel("Generated-sample NLL under target density (lower is better)")
+    ax.set_title(f"{dataset_title}: sample fidelity")
+    ax.set_ylabel("Target NLL of generated samples ↓")
     ax.set_xticks(group_positions, [_output_label(key) for key in output_prefixes])
     ax.grid(axis="y", alpha=0.25, linewidth=0.8, zorder=0)
     ax.legend(frameon=False, loc="best")

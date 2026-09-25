@@ -1,9 +1,7 @@
 """
 AYF-style interval flow map experiment on CIFAR-10.
 
-Applies the Uniform RF + AYF experiment to CIFAR-10 latents. Mirror of
-:mod:`mnist.uniform_rf`; only the dataset, the latent grid (8x8 rather than
-7x7), the default channel count and the RGB figure code differ.
+Applies the Uniform RF + AYF experiment to an 8x8 grid of CIFAR-10 latents.
 
 Pipeline:
   1. Train convolutional AE (32×32×3 → latent_dim-d bounded latent).

@@ -12,7 +12,7 @@ import unittest
 
 import torch
 
-from core.seeding import derive_seed, seed_stream, stream_generator
+from core.seeding import derive_seed, seed_stream
 from toy import edm_baseline, gaussian_rf, uniform_rf
 from toy.common import make_run_samplers
 
@@ -108,37 +108,6 @@ class ArmSeedingTests(unittest.TestCase):
                 self.assertIn("make_run_samplers", names)
                 self.assertIn("seed_stream", names)
                 self.assertNotIn("manual_seed", names)
-
-    def test_mnist_arms_use_named_streams(self):
-        from mnist import edm_baseline as mnist_edm
-        from mnist import gaussian_rf as mnist_gaussian
-        from mnist import uniform_rf as mnist_uniform
-
-        for module in (mnist_uniform, mnist_gaussian, mnist_edm):
-            names = module.main.__code__.co_names
-            with self.subTest(arm=module.__name__):
-                self.assertIn("stream_generator", names)
-                self.assertIn("seed_stream", names)
-                self.assertNotIn("manual_seed", names)
-
-
-class MNISTStreamTests(unittest.TestCase):
-    def test_latent_sampler_takes_a_generator(self):
-        from mnist.ae import make_mnist_latent_sampler
-
-        latents = torch.arange(100.0).unsqueeze(1)
-        teacher = make_mnist_latent_sampler(
-            latents, "cpu", generator=stream_generator(0, "teacher-data")
-        )
-        student = make_mnist_latent_sampler(
-            latents, "cpu", generator=stream_generator(0, "student-data")
-        )
-        again = make_mnist_latent_sampler(
-            latents, "cpu", generator=stream_generator(0, "teacher-data")
-        )
-        batch = teacher(32)
-        self.assertFalse(torch.equal(batch, student(32)))
-        self.assertTrue(torch.equal(batch, again(32)))
 
 
 if __name__ == "__main__":

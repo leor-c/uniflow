@@ -2,7 +2,6 @@
 EDM baseline experiment on CIFAR-10.
 
 Uses Gaussian perturbations and EDM preconditioning with the shared CIFAR-10 AE.
-Mirror of :mod:`mnist.edm_baseline`.
 
 Usage:
     python -m cifar10.edm_baseline

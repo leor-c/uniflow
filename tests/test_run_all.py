@@ -44,6 +44,8 @@ def _args(**overrides):
         dataset=None, latent_dim=None, ae_steps=None, teacher_steps=None,
         student_steps=None, train_mode=None, ff=None, ae_weight_decay=None,
         reflow_rounds=None, reflow_steps=None,
+        teacher_lr=None, teacher_final_lr=None, teacher_lr_drop_step=None,
+        student_lr=None, student_final_lr=None, student_lr_drop_step=None,
         ae_ff_scale=None, teacher_ff_scale=None, student_ff_scale=None,
     )
     unknown = set(overrides) - set(fields)
@@ -53,6 +55,40 @@ def _args(**overrides):
 
 
 class RunAllAggregationTests(unittest.TestCase):
+    def test_learning_rate_overrides_reach_every_arm(self):
+        from toy.run_all import PIPELINE_MODULES
+        for module, teacher_field, student_field in PIPELINE_MODULES.values():
+            cfg = _apply_overrides(
+                module.Config(device="cpu"),
+                _args(teacher_lr=2e-3, teacher_final_lr=2e-4,
+                      teacher_lr_drop_step=20, student_lr_drop_step=-1),
+                seed=1, teacher_field=teacher_field, student_field=student_field,
+            )
+            self.assertEqual(getattr(cfg, teacher_field.replace("_steps", "_lr")), 2e-3)
+            self.assertEqual(cfg.teacher_final_lr, 2e-4)
+            self.assertEqual(cfg.teacher_lr_drop_step, 20)
+            self.assertIsNone(cfg.student_lr_drop_step)
+
+    def test_resume_requires_matching_schedule_and_training_budget(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        from unittest.mock import patch
+        from toy.common import run_config_record
+        from toy.run_all import PIPELINE_MODULES, _load_seed_metrics
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {name: Path(tmp) / f"{name}.json" for name in PIPELINE_MODULES}
+            for name, (module, _, _) in PIPELINE_MODULES.items():
+                metrics = _pipeline_metrics(0.1, protocol=True)
+                metrics["run_config"] = run_config_record(module.Config(device="cpu"))
+                paths[name].write_text(json.dumps(metrics))
+            with patch("toy.run_all._seed_metrics_path", side_effect=lambda name, *a: paths[name]):
+                self.assertIsNotNone(_load_seed_metrics("8gaussians", 1, _args()))
+                self.assertIsNone(_load_seed_metrics("8gaussians", 1, _args(teacher_final_lr=5e-5)))
+                self.assertIsNone(_load_seed_metrics("8gaussians", 1, _args(student_steps=20000)))
+                self.assertIsNone(_load_seed_metrics("8gaussians", 1, _args(teacher_lr_drop_step=-1)))
+
     def test_shared_overrides_include_latent_dimension(self):
         cfg = _Config()
         args = _args(latent_dim=8)
@@ -88,7 +124,7 @@ class RunAllAggregationTests(unittest.TestCase):
         self.assertEqual(set(resolve("lmd").values()), {"lmd"})
         self.assertEqual(set(resolve("emd+lmd").values()), {"emd+lmd"})
         # omitted -> each arm keeps its own default rather than being forced
-        self.assertEqual(resolve(None), {p: "emd" for p in PIPELINES})
+        self.assertEqual(resolve(None), {p: "lmd" for p in PIPELINES})
 
     def test_fourier_override_reaches_every_arm_and_zero_disables(self):
         """run_all must be able to ablate the Fourier sites across all arms."""
@@ -183,7 +219,7 @@ class RunAllAggregationTests(unittest.TestCase):
             with self.subTest(spec=bad):
                 with self.assertRaises(ValueError):
                     parse_ff_sites(bad)
-        # the AE site does not exist in the MNIST arms
+        # the AE site does not exist in the CIFAR-10 arms
         with self.assertRaises(ValueError):
             parse_ff_sites("ATS", allowed=("teacher", "student"))
 
@@ -200,17 +236,17 @@ class RunAllAggregationTests(unittest.TestCase):
         self.assertEqual(_worker_count(True, pending_seeds=5, requested=2), 2)
         self.assertEqual(_worker_count(False, pending_seeds=5, requested=5), 1)
 
-    def test_plot_all_seeds_adds_seed_suffix(self):
+    def test_plot_all_seeds_uses_run_directory(self):
         cfg = _Config()
         args = Namespace(plot_all_seeds=True, plot_seed=1)
 
         _configure_multi_seed_outputs(cfg, "edm_ayf", 3, args)
 
         self.assertTrue(cfg.save_figure)
-        self.assertEqual(cfg.out, "results/edm_ayf_{}-seed-3.png")
-        self.assertEqual(cfg.metrics_out, "results/seeds/edm_ayf_{}_seed3.json")
+        self.assertEqual(cfg.out, "results/toy/8gaussians/edm_ayf/seed_3/samples.png")
+        self.assertEqual(cfg.metrics_out, "results/toy/{}/edm_ayf/seed_3/metrics.json")
 
-    def test_single_plot_seed_keeps_release_figure_name(self):
+    def test_unplotted_seed_still_has_its_own_run_directory(self):
         cfg = _Config()
         cfg.out = "results/edm_ayf_{}.png"
         args = Namespace(plot_all_seeds=False, plot_seed=1)
@@ -218,9 +254,9 @@ class RunAllAggregationTests(unittest.TestCase):
         _configure_multi_seed_outputs(cfg, "edm_ayf", 2, args)
 
         self.assertFalse(cfg.save_figure)
-        self.assertEqual(cfg.out, "results/edm_ayf_{}.png")
+        self.assertEqual(cfg.out, "results/toy/8gaussians/edm_ayf/seed_2/samples.png")
 
-    def test_selected_plot_seed_gets_stable_seed_suffix(self):
+    def test_selected_plot_seed_gets_stable_run_directory(self):
         cfg = _Config()
         cfg.out = "results/edm_ayf_{}.png"
         args = Namespace(plot_all_seeds=False, plot_seed=1)
@@ -228,7 +264,7 @@ class RunAllAggregationTests(unittest.TestCase):
         _configure_multi_seed_outputs(cfg, "edm_ayf", 1, args)
 
         self.assertTrue(cfg.save_figure)
-        self.assertEqual(cfg.out, "results/edm_ayf_{}-seed-1.png")
+        self.assertEqual(cfg.out, "results/toy/8gaussians/edm_ayf/seed_1/samples.png")
 
     def test_aggregate_reports_seed_values_mean_and_sample_std(self):
         all_metrics = {
@@ -271,7 +307,7 @@ class RunAllAggregationTests(unittest.TestCase):
         self.assertIn("| Uniform RF + AYF | 1.500 ± 0.707", report)
         self.assertIn("150.0% ± 70.7%", report)
         self.assertIn("Aggregate target-NLL comparison", report)
-        self.assertIn("summary_two_moons.json", report)
+        self.assertIn("summary.json", report)
 
     def test_current_schema_rejects_mmd_metrics(self):
         old = {

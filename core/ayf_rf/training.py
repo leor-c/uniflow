@@ -15,11 +15,13 @@ from copy import copy
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 
 from ..lr_schedule import make_lr_scheduler
 
-from ..rf import RFTeacher
-from .models import RFIntervalFlowMap
+from ..rf import RFTeacher, sample_uniform_noise
+from .models import RFIntervalFlowMap, VelocityView
+from .sampling import sample_ayf_time_pair
 from .losses import (
     ayf_emd_loss,
     ayf_emd_ct_loss,
@@ -237,3 +239,65 @@ def train_student_interval(
         _train_student_interval_phase(
             student, teacher, latent_sampler, refined, step_offset=cfg.student_steps
         )
+
+
+def train_map_teacher(
+    flow_map: RFIntervalFlowMap,
+    latent_sampler: Callable[[int], torch.Tensor],
+    cfg,
+    noise_sampler=None,
+    label: str = "map teacher",
+) -> VelocityView:
+    """Train an interval flow map *as the RF teacher*, and return its velocity view.
+
+    The RF velocity target ``z1 - z0`` is already the ``s = 1`` slice of the
+    Euler slope (see :class:`core.ayf_rf.models.VelocityView`), so regressing
+    the slope onto it produces an ordinary RF teacher that happens to be an
+    ``RFIntervalFlowMap``. Teacher and student then share one class, and the
+    student can be initialized with ``student.load_state_dict(
+    flow_map.state_dict())`` -- every tensor copies, including the conditioning
+    projection that a separate ``RFTeacher`` cannot supply.
+
+    ``s`` is *sampled* from the student's own interval schedule rather than
+    pinned to 1. The velocity target does not depend on ``s``, so every slice
+    learns the same field and the student starts as "Euler step with the
+    teacher's velocity" across the whole ``(t, s)`` domain. Pinning ``s = 1``
+    instead leaves ``emb(s)`` constant and ``emb(s - t) = emb(1 - t)`` a clean
+    function of ``t``, which lets the teacher route time information through the
+    delta channel -- information that becomes wrong the moment the student
+    varies ``s``. Measured on the 2D toy benchmark at 80k student steps, a
+    student copied from an ``s``-pinned teacher reached -1.480 nats 1-step
+    target NLL against -1.675 for a sampled-``s`` teacher, the former losing
+    even to a randomly initialized student off the shipped ``RFTeacher``.
+    """
+    if noise_sampler is None:
+        noise_sampler = sample_uniform_noise
+
+    flow_map.train()
+    opt = torch.optim.AdamW(flow_map.parameters(), lr=cfg.teacher_lr)
+    scheduler = make_lr_scheduler(opt, cfg, "teacher")
+    for step in range(1, cfg.teacher_steps + 1):
+        with torch.no_grad():
+            z1 = latent_sampler(cfg.batch_size)
+        z0 = noise_sampler(cfg.batch_size, cfg.latent_dim, cfg.device)
+        t = torch.rand(cfg.batch_size, 1, device=cfg.device)
+        zt = (1.0 - t) * z0 + t * z1
+        # Source time is uniform (plain RF); only the target time follows the
+        # AYF interval schedule, so the slices the student will query are the
+        # slices that get trained.
+        _, s = sample_ayf_time_pair(
+            cfg.batch_size, cfg.device, eps=cfg.time_eps,
+            p_mean=cfg.interval_p_mean, p_std=cfg.interval_p_std,
+        )
+        loss = F.mse_loss(flow_map.slope(zt, t, s), z1 - z0)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if scheduler is not None:
+            scheduler.step()
+        if step % cfg.log_every == 0:
+            print(f"[{label}] step {step:05d} | loss {loss.item():.6f}")
+
+    flow_map.eval()
+    return VelocityView(flow_map)

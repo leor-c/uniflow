@@ -1,7 +1,7 @@
 """
 Gaussian-prior RF + AYF on CIFAR-10.
 
-Mirrors ``mnist.gaussian_rf``: the same convolutional autoencoder as the uniform
+Uses the same convolutional autoencoder as the uniform
 arm but WITHOUT the tanh boundary, followed by a fixed post-training rescaling
 of the latents by one global scalar. The base distribution is
 ``z0 ~ N(0, base_std^2 I)`` instead of ``U([-1, 1]^d)``; teacher, student,

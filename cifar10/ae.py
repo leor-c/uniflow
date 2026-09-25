@@ -1,9 +1,7 @@
 """
 Convolutional autoencoder for CIFAR-10 (32×32 RGB → bounded latent space).
 
-Mirror of :mod:`mnist.ae`. Same architecture family, same latent contract, same
-public API. The architectural differences are called out below; training also
-adds a frozen VGG LPIPS perceptual loss to the pixel MSE.
+Training combines pixel MSE with a frozen VGG LPIPS perceptual loss.
 
 Architecture:
     Encoder: Conv(3→32, 1×1) → Conv(32→64, 3×3, s=2) → Conv(64→128, 3×3, s=2)
@@ -167,7 +165,7 @@ class CIFAR10Decoder(nn.Module):
             nn.Conv2d(64,  32, kernel_size=3, stride=1, padding=1),
             nn.SiLU(),
             nn.Conv2d(32, IMAGE_CHANNELS, kernel_size=1, stride=1, padding=0),
-            # Output is left unbounded, as in mnist.ae: the reconstruction loss
+            # Output is left unbounded, the reconstruction loss
             # includes MSE against pixels in [0, 1]. LPIPS and figures clamp.
         )
 
@@ -181,7 +179,7 @@ class CIFAR10Decoder(nn.Module):
 
 
 class CIFAR10AutoEncoder(nn.Module):
-    """Full CIFAR-10 AE, mirroring ``mnist.ae.MNISTAutoEncoder``.
+    """Full CIFAR-10 autoencoder.
 
     ``bounded=True`` gives tanh latents in ``(-1, 1)^d`` for the uniform arm.
     ``bounded=False`` trains a plain reconstruction autoencoder whose latents are
@@ -346,7 +344,7 @@ def make_cifar10_data_loader(
 
     Pixels stay in ``[0, 1]`` rather than the ``[-1, 1]`` many CIFAR diffusion
     codebases use: the flow never sees pixels here, only AE latents, and
-    matching :mod:`mnist.ae` keeps the reconstruction MSE scale and the figure
+    this keeps the reconstruction MSE scale and the figure
     clamp identical across the two datasets.
 
     ``generator`` drives the shuffle, so the batch order is a function of that

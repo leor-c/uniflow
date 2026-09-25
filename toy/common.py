@@ -440,6 +440,7 @@ RUN_CONFIG_FIELDS = (
     "ff_size", "ae_ff_scale", "teacher_ff_scale", "student_ff_scale",
     "ff_input_scale", "latent_reg_weight", "base_std", "ae_weight_decay",
     "reflow_rounds", "reflow_steps", "reflow_pairs", "reflow_ode_steps",
+    "shared_teacher",
     "ae_lr", "teacher_lr", "student_lr", "edm_teacher_lr",
     "teacher_lr_drop_step", "teacher_final_lr",
     "student_lr_drop_step", "student_final_lr",

@@ -125,6 +125,24 @@ class Config:
     # the data, so too few steps here bakes integration error into the teacher.
     reflow_ode_steps: int = 256
 
+    # --- Shared-architecture teacher --------------------------------------
+    # Train the RF teacher as an RFIntervalFlowMap (velocity regression on its
+    # slope at sampled s) instead of an RFTeacher, then initialize the student
+    # with a full weight copy of it. Teacher and student differ only in the
+    # width of the conditioning projection otherwise, so a separate RFTeacher
+    # is the only reason the student has to start from scratch.
+    #
+    # Measured on 8-Gaussians, LMD, 3 seeds: at the shipped 80k student steps
+    # this is worth ~0.13 nats 1-step / ~0.18 nats 8-step target NLL, almost
+    # all of it from the map teacher rather than the copy. At a 10k budget the
+    # split reverses and the copy carries it -- copy-initialized students reach
+    # -1.52 nats 8-step against -0.82 for scratch, within 0.09 of a scratch
+    # student trained 8x longer. It also cuts seed spread ~3-8x.
+    #
+    # Off by default: it changes every teacher and student number this arm
+    # records, so switching it on is a deliberate re-baselining, not a default.
+    shared_teacher: bool = False
+
     # AYF interval student
     student_lr: float = 1e-3
     student_lr_drop_step: int | None = 40_000
@@ -273,6 +291,9 @@ def main(cfg: Config | None = None):
             choices=["emd", "lmd", "emd+lmd", "ct", "ct+lmd"],
         )
         ap.add_argument("--lmd-weight", type=float, default=None)
+        ap.add_argument("--shared-teacher", action="store_true",
+                        help="Train the RF teacher as an interval flow map and "
+                             "initialize the student from its weights.")
         ap.add_argument("--ae-latent-reg-weight", type=float, default=None)
         ap.add_argument(
             "--ae-ff-scale", type=float, default=None,
@@ -335,6 +356,7 @@ def main(cfg: Config | None = None):
             cfg.teacher_steps = args.teacher_steps
         if args.lmd_weight is not None:
             cfg.lmd_weight = args.lmd_weight
+        cfg.shared_teacher = args.shared_teacher
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
 
@@ -401,16 +423,29 @@ def main(cfg: Config | None = None):
     teacher_latents = make_latent_sampler(ae, samplers.teacher, cfg.device)
     student_latents = make_latent_sampler(ae, samplers.student, cfg.device)
 
-    # RF teacher with a uniform base distribution
+    # RF teacher with a uniform base distribution. Under cfg.shared_teacher the
+    # teacher is itself an interval flow map, exposed to everything downstream
+    # through VelocityView, which has the RFTeacher call signature.
     seed_stream(cfg.seed, "teacher-init")
-    teacher = R.RFTeacher(
-        cfg.latent_dim, cfg.hidden, cfg.depth,
-        ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
-        ff_input_scale=cfg.ff_input_scale,
-    ).to(cfg.device)
-    print("\nTraining RF teacher...")
-    seed_stream(cfg.seed, "teacher-train")
-    R.train_teacher(teacher, teacher_latents, cfg)
+    if cfg.shared_teacher:
+        teacher_map = A.RFIntervalFlowMap(
+            cfg.latent_dim, cfg.hidden, cfg.depth,
+            ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
+            ff_input_scale=cfg.ff_input_scale,
+        ).to(cfg.device)
+        print("\nTraining RF teacher (shared interval-map architecture)...")
+        seed_stream(cfg.seed, "teacher-train")
+        teacher = A.train_map_teacher(teacher_map, teacher_latents, cfg)
+    else:
+        teacher_map = None
+        teacher = R.RFTeacher(
+            cfg.latent_dim, cfg.hidden, cfg.depth,
+            ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
+            ff_input_scale=cfg.ff_input_scale,
+        ).to(cfg.device)
+        print("\nTraining RF teacher...")
+        seed_stream(cfg.seed, "teacher-train")
+        R.train_teacher(teacher, teacher_latents, cfg)
 
     # AYF interval student
     seed_stream(cfg.seed, "student-init")
@@ -419,6 +454,12 @@ def main(cfg: Config | None = None):
         ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
+    if teacher_map is not None:
+        # Same class, same arguments: every tensor copies, so the student opens
+        # as an Euler step with the teacher's velocity on the whole (t, s)
+        # domain rather than at random.
+        student.load_state_dict(teacher_map.state_dict())
+        print("  student initialized from the teacher's weights")
     print(f"\nTraining AYF interval flow map ({cfg.train_mode})...")
     seed_stream(cfg.seed, "student-train")
     A.train_student_interval(student, teacher, student_latents, cfg)
@@ -428,7 +469,10 @@ def main(cfg: Config | None = None):
         torch.save({
             "run_config": asdict(cfg),
             "ae": ae.state_dict(),
-            "teacher": teacher.state_dict(),
+            # Under shared_teacher the teacher is a VelocityView wrapper, whose
+            # state_dict is prefixed; save the map itself so the checkpoint
+            # loads back into the class that produced it.
+            "teacher": (teacher_map or teacher).state_dict(),
             "student": student.state_dict(),
         }, checkpoint_path)
         print(f"Saved model checkpoint -> {checkpoint_path}")

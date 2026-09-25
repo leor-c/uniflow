@@ -1,4 +1,4 @@
-"""Tests for the DiT backbone and the spatial MNIST latent.
+"""Tests for the DiT backbone.
 
 The properties that matter here are the ones the rest of the codebase silently
 depends on:
@@ -17,14 +17,14 @@ depends on:
 import unittest
 
 import torch
-import torch.nn as nn
 from torch.func import jvp
 
 from core.dit import DiT, make_backbone
 from core.edm.models import EDMConsistencyModel, EDMPrecondDenoiser
 from core.ayf_rf.models import RFIntervalFlowMap
 from core.rf.models import RFTeacher
-from mnist.ae import LATENT_GRID, MNISTAutoEncoder
+# An odd synthetic grid exercises patch validation independently of datasets.
+LATENT_GRID = 7
 
 SHAPE = (4, LATENT_GRID, LATENT_GRID)
 DIM = SHAPE[0] * SHAPE[1] * SHAPE[2]
@@ -148,86 +148,6 @@ class ForwardModeADTests(unittest.TestCase):
         """RFF changes in_dim and destroys the grid, so it must not silently pass."""
         with self.assertRaises(ValueError):
             RFTeacher(DIM, ff_scale=1.0, ff_size=8, **SMALL)
-
-
-class SpatialLatentAETests(unittest.TestCase):
-    def test_spatial_latent_is_flat_and_correctly_sized(self):
-        ae = MNISTAutoEncoder(latent_dim=DIM, bounded=True, latent_channels=4)
-        z = ae.encode(torch.randn(3, 1, 28, 28))
-        self.assertEqual(z.shape, (3, DIM))
-        self.assertEqual(ae.latent_shape, SHAPE)
-        self.assertEqual(ae.decode(z).shape, (3, 1, 28, 28))
-
-    def test_tanh_bounds_every_latent_pixel(self):
-        """The uniform arm's base is U([-1,1]) per dim, so bounds are elementwise."""
-        ae = MNISTAutoEncoder(latent_dim=DIM, bounded=True, latent_channels=4)
-        z = ae.encode(torch.randn(16, 1, 28, 28) * 5.0)
-        self.assertLessEqual(z.abs().max().item(), 1.0)
-
-    def test_flat_latent_path_still_works(self):
-        ae = MNISTAutoEncoder(latent_dim=64, bounded=True, latent_channels=None)
-        z = ae.encode(torch.randn(3, 1, 28, 28))
-        self.assertEqual(z.shape, (3, 64))
-        self.assertIsNone(ae.latent_shape)
-
-    def test_unbounded_normalization_is_a_global_scalar(self):
-        ae = MNISTAutoEncoder(latent_dim=DIM, bounded=False, latent_channels=4)
-        ae.fit_latent_normalization(torch.randn(64, 1, 28, 28))
-        self.assertEqual(ae.latent_mean.shape, (DIM,))
-        # One scalar broadcast across dims, so the transform stays a similarity.
-        self.assertEqual(ae.latent_std.unique().numel(), 1)
-
-    def test_mismatched_latent_dim_is_rejected(self):
-        with self.assertRaises(ValueError):
-            MNISTAutoEncoder(latent_dim=100, bounded=True, latent_channels=4)
-
-    def test_encoder_head_is_convolutional_when_spatial(self):
-        """A Linear head would discard the grid before the DiT ever sees it."""
-        spatial = MNISTAutoEncoder(latent_dim=DIM, bounded=True, latent_channels=4)
-        self.assertIsInstance(spatial.encoder.head, nn.Conv2d)
-        flat = MNISTAutoEncoder(latent_dim=64, bounded=True)
-        self.assertIsInstance(flat.encoder.head, nn.Linear)
-
-
-class ArmConfigTests(unittest.TestCase):
-    """Every MNIST arm must agree on the latent layout and default to the DiT."""
-
-    def _arms(self):
-        from mnist import edm_baseline, gaussian_rf, uniform_rf
-        return {"uniform_rf": uniform_rf, "gaussian_rf": gaussian_rf,
-                "edm_baseline": edm_baseline}
-
-    def test_defaults_are_a_4x7x7_dit(self):
-        for name, module in self._arms().items():
-            with self.subTest(arm=name):
-                cfg = module.Config()
-                self.assertEqual(cfg.arch, "dit")
-                self.assertEqual(cfg.latent_channels, 4)
-                self.assertEqual(cfg.latent_dim, DIM)
-                self.assertEqual(cfg.latent_shape, SHAPE)
-
-    def test_latent_dim_is_derived_not_set(self):
-        for name, module in self._arms().items():
-            with self.subTest(arm=name):
-                cfg = module.Config(latent_channels=8)
-                self.assertEqual(cfg.latent_dim, 8 * 49)
-                # latent_dim is never an independent knob
-                self.assertEqual(module.Config(latent_dim=1234).latent_dim, DIM)
-
-    def test_backbone_kwargs_build_a_working_model(self):
-        for name, module in self._arms().items():
-            with self.subTest(arm=name):
-                cfg = module.Config()
-                cfg.hidden, cfg.depth, cfg.heads = 48, 2, 4
-                model = RFTeacher(cfg.latent_dim, cfg.hidden, cfg.depth,
-                                  **cfg.backbone_kwargs)
-                out = model(torch.randn(2, cfg.latent_dim), torch.rand(2, 1))
-                self.assertEqual(out.shape, (2, cfg.latent_dim))
-
-    def test_fast_config_keeps_the_spatial_latent(self):
-        for name, module in self._arms().items():
-            with self.subTest(arm=name):
-                self.assertEqual(module.fast_cpu_config().latent_dim, DIM)
 
 
 if __name__ == "__main__":

@@ -229,6 +229,7 @@ class EDMAYFStudentTests(unittest.TestCase):
 
     def test_student_training_reads_the_shared_ayf_config_fields(self):
         cfg = EDMConfig(device="cpu")
+        cfg.train_mode = "emd"  # This test intercepts the EMD loss explicitly.
         cfg.student_steps = 1
         cfg.log_every = 10 ** 9
         recorded = {}

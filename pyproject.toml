@@ -11,8 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Both image-space extensions pull their datasets through torchvision.
-mnist = ["torchvision>=0.15"]
+# The image-space extension loads its dataset through torchvision.
 cifar10 = ["torchvision>=0.15", "lpips>=0.1.4"]
 
 [build-system]
@@ -20,4 +19,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "toy*", "mnist*", "cifar10*"]
+include = ["core*", "toy*", "cifar10*"]

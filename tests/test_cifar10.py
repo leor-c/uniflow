@@ -13,7 +13,10 @@ are the same ones plus the places the mirror could silently drift:
   differ from MNIST's single channel.
 """
 
+import builtins
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
@@ -22,7 +25,7 @@ from torch.func import jvp
 from core.ayf_rf.models import RFIntervalFlowMap
 from core.edm.models import EDMPrecondDenoiser
 from core.rf.models import RFTeacher
-from cifar10.ae import LATENT_GRID, IMAGE_CHANNELS, CIFAR10AutoEncoder
+from cifar10.ae import LATENT_GRID, IMAGE_CHANNELS, CIFAR10AutoEncoder, train_cifar10_ae
 
 SHAPE = (8, LATENT_GRID, LATENT_GRID)
 DIM = SHAPE[0] * SHAPE[1] * SHAPE[2]
@@ -74,6 +77,99 @@ class SpatialLatentAETests(unittest.TestCase):
         self.assertIsInstance(flat.encoder.head, nn.Linear)
 
 
+class AEPerceptualLossTests(unittest.TestCase):
+    class TinyAE(nn.Module):
+        bounded = True
+
+        def __init__(self):
+            super().__init__()
+            self.pixels = nn.Parameter(torch.full((1, *IMAGE), 0.25))
+
+        def forward(self, x):
+            return self.pixels.expand_as(x), self.pixels.flatten(1).expand(len(x), -1)
+
+    class PerceptualProbe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(()))
+            self.inputs = None
+
+        def forward(self, prediction, target):
+            self.inputs = (prediction.detach(), target.detach())
+            # Nonzero perceptual gradient even when pixel MSE is zero, so the
+            # test can isolate its contribution to the AE update.
+            return self.scale * (prediction - target - 1).square().mean((1, 2, 3))
+
+    def train_once(self, ae, weight):
+        loader = [(torch.full((2, *IMAGE), 0.25), torch.zeros(2))]
+        train_cifar10_ae(
+            ae, loader, iters=1, lr=1e-3, device="cpu",
+            latent_spread_weight=0, weight_decay=0, lpips_weight=weight,
+        )
+
+    def patch_lpips(self, module):
+        original_import = builtins.__import__
+
+        def import_module(name, *args, **kwargs):
+            if name == "lpips":
+                if module is None:
+                    raise ImportError("lpips unavailable")
+                return module
+            return original_import(name, *args, **kwargs)
+
+        return patch("builtins.__import__", side_effect=import_module)
+
+    def test_lpips_backpropagates_to_ae_but_keeps_features_frozen(self):
+        ae = self.TinyAE()
+        probe = self.PerceptualProbe()
+        factory = Mock(return_value=probe)
+        with self.patch_lpips(SimpleNamespace(LPIPS=factory)):
+            self.train_once(ae, 0.5)
+        factory.assert_called_once_with(net="vgg")
+        self.assertFalse(probe.training)
+        self.assertFalse(probe.scale.requires_grad)
+        self.assertIsNone(probe.scale.grad)
+        # d(0.5 * (2*p - 2*x - 1)^2)/dp = -2 at p=x,
+        # averaged over all pixels (and the repeated batch).
+        torch.testing.assert_close(
+            ae.pixels.grad, torch.full_like(ae.pixels, -2 / ae.pixels.numel()),
+        )
+        self.assertTrue((ae.pixels > 0.25).all())
+        self.assertFalse(ae.training)
+
+    def test_lpips_inputs_are_clamped_and_scaled_but_mse_is_unclamped(self):
+        ae = self.TinyAE()
+        with torch.no_grad():
+            ae.pixels[:, 0].fill_(-1)
+            ae.pixels[:, 2].fill_(2)
+        probe = self.PerceptualProbe()
+        with self.patch_lpips(SimpleNamespace(LPIPS=lambda **kw: probe)):
+            self.train_once(ae, 0.5)
+        prediction, target = probe.inputs
+        self.assertEqual(prediction.shape, (2, *IMAGE))
+        torch.testing.assert_close(prediction[:, 0], torch.full_like(prediction[:, 0], -1))
+        torch.testing.assert_close(prediction[:, 1], torch.full_like(prediction[:, 1], -0.5))
+        torch.testing.assert_close(prediction[:, 2], torch.ones_like(prediction[:, 2]))
+        torch.testing.assert_close(target, torch.full_like(target, -0.5))
+        self.assertTrue((ae.pixels.grad[:, 0] < 0).all())
+        self.assertTrue((ae.pixels.grad[:, 2] > 0).all())
+
+    def test_zero_weight_needs_no_lpips_and_preserves_mse_training(self):
+        ae = self.TinyAE()
+        with self.patch_lpips(None):
+            self.train_once(ae, 0)
+        torch.testing.assert_close(ae.pixels, torch.full_like(ae.pixels, 0.25))
+        torch.testing.assert_close(ae.pixels.grad, torch.zeros_like(ae.pixels))
+
+    def test_invalid_weights_and_missing_dependency_fail_clearly(self):
+        with self.patch_lpips(None):
+            for weight in (-1, float("nan"), float("inf")):
+                with self.subTest(weight=weight), self.assertRaisesRegex(ValueError, "lpips_weight"):
+                    self.train_once(self.TinyAE(), weight)
+            with self.assertRaisesRegex(ImportError, "cifar10"):
+                self.train_once(self.TinyAE(), 0.1)
+
+
 class ArmConfigTests(unittest.TestCase):
     """Every CIFAR-10 arm must agree on the latent layout and default to the DiT."""
 
@@ -90,6 +186,7 @@ class ArmConfigTests(unittest.TestCase):
                 self.assertEqual(cfg.latent_channels, 8)
                 self.assertEqual(cfg.latent_dim, DIM)
                 self.assertEqual(cfg.latent_shape, SHAPE)
+                self.assertEqual(cfg.ae_lpips_weight, 0.1)
 
     def test_latent_dim_is_derived_not_set(self):
         for name, module in self._arms().items():
@@ -126,17 +223,9 @@ class ArmConfigTests(unittest.TestCase):
             with self.subTest(arm=name):
                 self.assertEqual(module.fast_cpu_config().latent_dim, DIM)
 
-    def test_out_dirs_do_not_collide_with_mnist(self):
-        """Both packages write image grids; a shared path would overwrite them."""
-        from mnist import edm_baseline as mnist_edm
-        from mnist import gaussian_rf as mnist_gaussian
-        from mnist import uniform_rf as mnist_uniform
-
-        mnist_dirs = {m.Config().out_dir for m in
-                      (mnist_uniform, mnist_gaussian, mnist_edm)}
+    def test_out_dirs_are_distinct(self):
         cifar_dirs = {m.Config().out_dir for m in self._arms().values()}
         self.assertEqual(len(cifar_dirs), 3)
-        self.assertFalse(mnist_dirs & cifar_dirs)
 
 
 class ForwardModeADTests(unittest.TestCase):
@@ -244,7 +333,8 @@ class RunAllTests(unittest.TestCase):
             data_root=None, latent_channels=4, arch="mlp", patch=None,
             train_mode="lmd", ff=None, teacher_ff_scale=None,
             student_ff_scale=None, reflow_rounds=1, reflow_steps=None,
-            ae_weight_decay=0.0, ae_steps=7, teacher_steps=11, student_steps=13,
+            ae_weight_decay=0.0, ae_lpips_weight=0.25,
+            ae_steps=7, teacher_steps=11, student_steps=13,
         )
         for pipeline in PIPELINES:
             module, teacher_field, student_field, _ = PIPELINE_MODULES[pipeline]
@@ -259,6 +349,7 @@ class RunAllTests(unittest.TestCase):
                 self.assertEqual(cfg.arch, "mlp")
                 self.assertEqual(cfg.train_mode, "lmd")
                 self.assertEqual(cfg.ae_weight_decay, 0.0)
+                self.assertEqual(cfg.ae_lpips_weight, 0.25)
                 self.assertEqual(cfg.ae_steps, 7)
                 self.assertEqual(getattr(cfg, teacher_field), 11)
                 self.assertEqual(getattr(cfg, student_field), 13)
@@ -273,7 +364,7 @@ class RunAllTests(unittest.TestCase):
             data_root=None, latent_channels=None, arch=None, patch=None,
             train_mode=None, ff=None, teacher_ff_scale=None,
             student_ff_scale=None, reflow_rounds=2, reflow_steps=99,
-            ae_weight_decay=None, ae_steps=None, teacher_steps=None,
+            ae_weight_decay=None, ae_lpips_weight=None, ae_steps=None, teacher_steps=None,
             student_steps=None,
         )
         cfg = _apply_overrides(

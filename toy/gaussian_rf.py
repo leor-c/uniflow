@@ -119,6 +119,16 @@ class Config:
     reflow_ode_steps: int = 128
 
     # AYF student for the Gaussian RF teacher
+    # --- Shared-architecture teacher --------------------------------------
+    # Train the RF teacher as an RFIntervalFlowMap (velocity regression on its
+    # slope at sampled s) and initialize the student with a full weight copy.
+    # Identical in meaning and default to toy.uniform_rf.Config.shared_teacher;
+    # both RF arms must be set the same way or the benchmark stops comparing
+    # base distributions. The EDM arm cannot honor it at all -- its teacher is
+    # an EDM denoiser, not a velocity field with the student's architecture --
+    # so toy.run_all refuses to run a cross-arm comparison with it enabled.
+    shared_teacher: bool = False
+
     student_lr: float = 1e-3
     student_lr_drop_step: int | None = 40_000
     student_final_lr: float = 1e-4
@@ -244,6 +254,10 @@ def main(cfg: Config | None = None):
             "--train-mode", default="lmd", choices=["emd", "lmd", "emd+lmd"],
         )
         ap.add_argument("--lmd-weight", type=float, default=None)
+        ap.add_argument("--shared-teacher", action="store_true",
+                        help="Train the RF teacher as an interval flow map and "
+                             "initialize the student from its weights. Must "
+                             "match the uniform arm; unavailable for EDM.")
         ap.add_argument("--base-std", type=float, default=1.0)
         ap.add_argument(
             "--ae-ff-scale", type=float, default=None,
@@ -298,6 +312,7 @@ def main(cfg: Config | None = None):
             cfg.teacher_steps = args.teacher_steps
         if args.student_steps is not None:
             cfg.student_steps = args.student_steps
+        cfg.shared_teacher = args.shared_teacher
         if args.lmd_weight is not None:
             cfg.lmd_weight = args.lmd_weight
 
@@ -348,16 +363,33 @@ def main(cfg: Config | None = None):
     teacher_latents = make_latent_sampler(ae, samplers.teacher, cfg.device)
     student_latents = make_latent_sampler(ae, samplers.student, cfg.device)
 
-    # RF teacher with Gaussian noise
+    # RF teacher with Gaussian noise. Under cfg.shared_teacher the teacher is
+    # itself an interval flow map, exposed through VelocityView; the base
+    # distribution stays Gaussian either way, since the noise sampler is what
+    # carries it.
     seed_stream(cfg.seed, "teacher-init")
-    teacher = RFTeacher(
-        cfg.latent_dim, cfg.hidden, cfg.depth,
-        ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
-        ff_input_scale=cfg.ff_input_scale,
-    ).to(cfg.device)
-    print("\nTraining RF teacher (Gaussian noise)...")
-    seed_stream(cfg.seed, "teacher-train")
-    A.train_teacher_gaussian(teacher, teacher_latents, cfg)
+    gaussian_noise = lambda b, d, dev: A.sample_noise(b, d, dev, cfg.base_std)
+    if cfg.shared_teacher:
+        teacher_map = A.RFIntervalFlowMap(
+            cfg.latent_dim, cfg.hidden, cfg.depth,
+            ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
+            ff_input_scale=cfg.ff_input_scale,
+        ).to(cfg.device)
+        print("\nTraining RF teacher (Gaussian noise, shared interval-map "
+              "architecture)...")
+        seed_stream(cfg.seed, "teacher-train")
+        teacher = A.train_map_teacher(
+            teacher_map, teacher_latents, cfg, noise_sampler=gaussian_noise)
+    else:
+        teacher_map = None
+        teacher = RFTeacher(
+            cfg.latent_dim, cfg.hidden, cfg.depth,
+            ff_scale=cfg.teacher_ff_scale, ff_size=cfg.ff_size,
+            ff_input_scale=cfg.ff_input_scale,
+        ).to(cfg.device)
+        print("\nTraining RF teacher (Gaussian noise)...")
+        seed_stream(cfg.seed, "teacher-train")
+        A.train_teacher_gaussian(teacher, teacher_latents, cfg)
 
     # AYF interval student (same RFIntervalFlowMap as ayf_rf)
     seed_stream(cfg.seed, "student-init")
@@ -366,6 +398,9 @@ def main(cfg: Config | None = None):
         ff_scale=cfg.student_ff_scale, ff_size=cfg.ff_size,
         ff_input_scale=cfg.ff_input_scale,
     ).to(cfg.device)
+    if teacher_map is not None:
+        student.load_state_dict(teacher_map.state_dict())
+        print("  student initialized from the teacher's weights")
     print(f"\nTraining Gaussian RF + AYF student ({cfg.train_mode})...")
     seed_stream(cfg.seed, "student-train")
     A.train_student_ayf(student, teacher, student_latents, cfg)

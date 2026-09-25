@@ -166,15 +166,15 @@ class TrainModeTests(unittest.TestCase):
         cfg = SimpleNamespace(train_mode="emd", emd_weight=1.0, lmd_weight=1.0)
         self.assertEqual(resolve_train_mode(cfg), frozenset({"emd"}))
 
-    def test_every_toy_arm_defaults_to_emd_only(self):
+    def test_every_toy_arm_defaults_to_lmd_only(self):
         from toy import edm_baseline, gaussian_rf, uniform_rf
 
         for module in (uniform_rf, gaussian_rf, edm_baseline):
             cfg = module.Config(device="cpu")
             with self.subTest(arm=module.__name__):
-                self.assertEqual(cfg.train_mode, "emd")
+                self.assertEqual(cfg.train_mode, "lmd")
                 self.assertEqual(
-                    resolve_train_mode(cfg, allow_ct=True), frozenset({"emd"}),
+                    resolve_train_mode(cfg, allow_ct=True), frozenset({"lmd"}),
                 )
 
     def test_every_toy_arm_can_select_lmd_the_same_way(self):
@@ -188,6 +188,83 @@ class TrainModeTests(unittest.TestCase):
                     self.assertEqual(
                         resolve_train_mode(cfg, allow_ct=True), frozenset(expected),
                     )
+
+
+class SharedTeacherParityTests(unittest.TestCase):
+    """The shared-architecture teacher must not split the arms' methodology.
+
+    It initializes the student from the teacher's weights, which only the RF
+    arms can do -- the EDM arm's teacher is a denoiser, not a velocity field
+    built from the student's class. Enabled on some arms and not others, the
+    benchmark would compare student initializations instead of base
+    distributions, which is exactly the failure this module exists to catch.
+    """
+
+    def test_both_rf_arms_expose_the_flag_and_default_it_off(self):
+        from toy import gaussian_rf, uniform_rf
+
+        for module in (uniform_rf, gaussian_rf):
+            with self.subTest(arm=module.__name__):
+                cfg = module.Config(device="cpu")
+                self.assertFalse(
+                    cfg.shared_teacher,
+                    "default must stay off; turning it on re-baselines the arm",
+                )
+
+    def test_the_edm_arm_does_not_pretend_to_support_it(self):
+        from toy import edm_baseline
+
+        self.assertFalse(hasattr(edm_baseline.Config(device="cpu"), "shared_teacher"))
+
+    def test_the_cross_arm_runner_refuses_an_enabled_flag(self):
+        from toy import run_all, uniform_rf
+
+        cfg = uniform_rf.Config(device="cpu")
+        cfg.shared_teacher = True
+        args = SimpleNamespace(
+            dataset=None, latent_dim=None, train_mode=None, ff=None,
+            ae_ff_scale=None, teacher_ff_scale=None, student_ff_scale=None,
+            reflow_rounds=None, reflow_steps=None, ae_weight_decay=None,
+            ae_steps=None, teacher_steps=None, student_steps=None,
+        )
+        with patch("toy.run_all.apply_lr_overrides"), \
+                patch("toy.run_all.apply_ff_spec"):
+            with self.assertRaises(ValueError) as caught:
+                run_all._apply_overrides(
+                    cfg, args, seed=0,
+                    teacher_field="teacher_steps", student_field="student_steps",
+                )
+        self.assertIn("shared_teacher", str(caught.exception))
+
+    def test_the_runner_accepts_the_arms_as_shipped(self):
+        from toy import edm_baseline, gaussian_rf, run_all, uniform_rf
+
+        args = SimpleNamespace(
+            dataset=None, latent_dim=None, train_mode=None, ff=None,
+            ae_ff_scale=None, teacher_ff_scale=None, student_ff_scale=None,
+            reflow_rounds=None, reflow_steps=None, ae_weight_decay=None,
+            ae_steps=None, teacher_steps=None, student_steps=None,
+        )
+        for module, teacher_field in ((uniform_rf, "teacher_steps"),
+                                      (gaussian_rf, "teacher_steps"),
+                                      (edm_baseline, "edm_teacher_steps")):
+            with self.subTest(arm=module.__name__):
+                with patch("toy.run_all.apply_lr_overrides"), \
+                        patch("toy.run_all.apply_ff_spec"):
+                    run_all._apply_overrides(
+                        module.Config(device="cpu"), args, seed=0,
+                        teacher_field=teacher_field,
+                        student_field="student_steps",
+                    )
+
+    def test_both_rf_arms_record_the_flag_with_their_results(self):
+        from toy.common import run_config_record
+        from toy import gaussian_rf, uniform_rf
+
+        for module in (uniform_rf, gaussian_rf):
+            with self.subTest(arm=module.__name__):
+                self.assertIn(
+                    "shared_teacher", run_config_record(module.Config(device="cpu")))
 
 
 class StopGradientTests(unittest.TestCase):

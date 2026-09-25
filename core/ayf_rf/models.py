@@ -96,3 +96,35 @@ class RFIntervalFlowMap(nn.Module):
         if s.ndim == 1:
             s = s[:, None]
         return z + (s - t) * self.slope(z, t, s)
+
+
+class VelocityView(nn.Module):
+    """Expose an :class:`RFIntervalFlowMap`'s ``s = 1`` slope as a velocity field.
+
+    Gives the flow map the ``RFTeacher`` call signature ``v(z, t)``, so an
+    interval map trained as a teacher (see
+    :func:`core.ayf_rf.training.train_map_teacher`) drops into every place that
+    takes a teacher -- the AYF losses, the ODE samplers, the eval metrics --
+    without any of them knowing the difference.
+
+    The identification is exact rather than approximate. Under the RF
+    interpolant ``z_t = (1-t) z0 + t z1`` the velocity target is ``z1 - z0``,
+    and the Euler parameterization gives
+
+        C(z,t,1) = z + (1-t) F(z,t,1),
+
+    which is the ``x1``-prediction exactly when ``F(z,t,1) = E[z1 - z0 | z_t]``.
+    So the ``s = 1`` slice of the slope *is* the RF velocity; nothing is
+    reparameterized here.
+
+    Holds a reference, not a copy: the wrapper never owns or updates weights.
+    """
+
+    def __init__(self, flow_map: RFIntervalFlowMap):
+        super().__init__()
+        self.flow_map = flow_map
+
+    def forward(self, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if t.ndim == 1:
+            t = t[:, None]
+        return self.flow_map.slope(z, t, torch.ones_like(t))
