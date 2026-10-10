@@ -1,12 +1,12 @@
 # UniFlow
 
-Diffusion and flow models predominantly use Gaussian noise, commonly paired with latent rescaling to match its unit scale. When latent representations evolve (e.g., during online learning), a fixed calibration can become stale. Online estimates can track these changes, but introduce normalization state and update-rate choices.
+**UniFlow investigates a simple alternative to Gaussian noise in latent diffusion / flow: uniform noise on $[-1,1]^d$, paired with a `tanh` applied to the encoder output**. This places the latents inside the noise cube and gives them a fixed range without a separate latent-rescaling step. To our knowledge, this pairing has not been studied outside our work.
 
-This repo studies an alternative: uniform noise on [-1, 1] paired with tanh-bounded latents (a tanh applied to the encoder output). The latent support lies inside the noise cube, avoiding the need for post-training rescaling. This does not guarantee that encoded data fill the cube or have stable moments as the encoder evolves.
+The approach was first used in [Horizon Imagination](https://github.com/leor-c/horizon-imagination)’s visual world model. Its performance there motivated this repository: evaluating the combination separately from the larger system and understanding how it compares with the Gaussian baseline.
 
-The study uses 1-Rectified Flow (RF) and compares the standard Gaussian noise baseline against the uniform noise variant, with an EDM baseline included for reference. It also evaluates Align Your Flow (AYF) distillation, training an AYF student for each baseline.
+The experiments use controlled 2D benchmarks to compare uniform and Gaussian 1-Rectified Flow, with EDM included for reference. They evaluate both generation and Align Your Flow (AYF) distillation to assess the viability and tradeoffs of the approach. 
 
-The uniform noise + tanh latents idea started in [Horizon Imagination](https://github.com/leor-c/horizon-imagination), where it was used in a complex visual RF world model. The paper and code provide further evidence for the performance of this approach at scale in a realistic online RL setting.
+A further motivation comes from online learning, where latent representations evolve as the encoder changes. Bounding the encoder output with `tanh` keeps its range fixed without maintaining running normalization statistics. This does not ensure stable latent moments or eliminate representation drift, but motivates exploring the approach in settings with a continually trained encoder.
 
 ---
 
