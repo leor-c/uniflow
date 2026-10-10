@@ -229,7 +229,7 @@ schedule as the teacher-init runs.
 
 ### 8-Gaussians
 
-<details>
+<details open>
 <summary>Scratch results and figures</summary>
 
 Seed 1 sample panels show target data, autoencoder reconstructions, teacher ODE
@@ -271,7 +271,7 @@ samples, and one- and eight-step AYF students.
 
 ### Two moons
 
-<details>
+<details open>
 <summary>Scratch results and figures</summary>
 
 Seed 1 sample panels show target data, autoencoder reconstructions, teacher ODE
