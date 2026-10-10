@@ -1,18 +1,4 @@
-"""
-2D toy datasets, all supported in the OPEN box (-1, 1)^2 (bounded domain).
-
-Design note (important for the stiffness story):
-  The bounded support is obtained by mapping points through tanh, NOT by
-  clamping. This mirrors the real pipeline, where latents are bounded because
-  they are produced by a tanh-bottlenecked encoder. Clamping would pile mass on
-  the box faces (a density spike => large ||grad^2 log rho|| at the boundary),
-  artificially inflating the measured stiffness L(t) near the edges. tanh-mapping
-  keeps the density smooth with open support, so any residual stiffness reflects
-  the method/fit, not a boundary artifact.
-
-So each dataset generates "pre-latent" points u in R^2 from a smooth density,
-then returns x = tanh(u) in (-1,1)^2. The induced density on x is smooth.
-"""
+"""2D toy data samplers for the autoencoder benchmark."""
 
 import math
 import torch
@@ -31,9 +17,8 @@ def _eight_gaussians_pre(n, std, radius, device, generator=None):
 
 def eight_gaussians(n, std=0.20, radius=1.2, device=None, generator=None):
     """
-    8 Gaussians in pre-tanh space, then tanh-mapped into (-1,1)^2.
-    radius/std are in pre-tanh coordinates; tanh compresses them toward the box.
-    Defaults give 8 well-separated but smoothly-supported modes inside the box.
+    Eight Gaussian modes in the plane. This sampler is not the benchmark
+    8-Gaussians path, which uses toy.common.sample_8gaussians.
     """
     u = _eight_gaussians_pre(n, std, radius, device, generator=generator)
     return u
@@ -55,9 +40,7 @@ def two_moons(n, noise=0.05, device=None, generator=None):
 
 def checkerboard(n, std=0.12, device=None, generator=None):
     """
-    Checkerboard of smooth Gaussian blobs (not hard squares), tanh-mapped.
-    Using blobs instead of uniform squares keeps the density smooth (no hard
-    edges), which is the regime where the theory predicts L->1 at the boundary.
+    Checkerboard of smooth Gaussian blobs rather than hard squares.
     """
     # blob centers on a grid in pre-tanh space, alternating (checkerboard parity)
     centers = []
@@ -71,10 +54,61 @@ def checkerboard(n, std=0.12, device=None, generator=None):
     return u
 
 
+def branching_tree_segments():
+    """Two mirrored binary trees, as (start, end) line segments in data space."""
+    segments = []
+    for side in (-1, 1):
+        start = (side * 0.02, 0.0)
+        end = (side * 0.25, 0.0)
+        segments.append((start, end))
+        tips = [(end, 0.0)]
+        for level in range(4):
+            children = []
+            length = 0.29 * 0.75**level
+            for origin, angle in tips:
+                for turn in (-0.65, 0.65):
+                    direction = angle + turn
+                    child = (
+                        origin[0] + side * length * math.cos(direction),
+                        origin[1] + 1.2 * length * math.sin(direction),
+                    )
+                    segments.append((origin, child))
+                    children.append((child, direction))
+            tips = children
+    return torch.tensor(segments, dtype=torch.float64)
+
+
+def branching_tree_quadrature(points=2048):
+    """Equally spaced arc-length midpoints for the tree's target density."""
+    segments = branching_tree_segments()
+    starts, ends = segments[:, 0], segments[:, 1]
+    lengths = (ends - starts).norm(dim=1)
+    cumulative = lengths.cumsum(dim=0)
+    positions = (torch.arange(points, dtype=torch.float64) + 0.5) * (
+        cumulative[-1] / points
+    )
+    index = torch.searchsorted(cumulative, positions)
+    previous = torch.cat([cumulative.new_zeros(1), cumulative[:-1]])
+    fraction = ((positions - previous[index]) / lengths[index]).unsqueeze(1)
+    return starts[index] + fraction * (ends[index] - starts[index])
+
+
+def branching_trees(n, device=None, generator=None):
+    """Sample exactly on two branching trees, with no added noise."""
+    segments = branching_tree_segments().to(device=device, dtype=torch.float32)
+    starts, ends = segments[:, 0], segments[:, 1]
+    lengths = (ends - starts).norm(dim=1)
+    branch = torch.multinomial(lengths, n, replacement=True, generator=generator)
+    position = torch.rand(n, 1, device=device, generator=generator)
+    points = starts[branch] + position * (ends[branch] - starts[branch])
+    return points
+
+
 DATASETS = {
     "8gaussians": eight_gaussians,
     "two_moons": two_moons,
     "checkerboard": checkerboard,
+    "branching_trees": branching_trees,
 }
 
 

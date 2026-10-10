@@ -160,7 +160,7 @@ bound is the one that addresses its cause; see
 
 ### Known deviations from the paper
 
-Two deliberate gaps, both verified against the paper rather than assumed:
+The scratch benchmark retains two deliberate differences from the paper:
 
 - **LMD is the Boffi et al. objective, not AYF-LMD.** AYF-LMD uses a stopgrad
   target; here gradients flow through the JVP and only the teacher velocity is
@@ -169,12 +169,15 @@ Two deliberate gaps, both verified against the paper rather than assumed:
   similarly", recommending AYF-LMD for training *efficiency* rather than
   quality. This also explains an asymmetry seen during development: the paper
   reports EMD needs the stopgrad and LMD does not.
-- **The student is randomly initialized.** The paper initializes "the student
-  model with pretrained flow matching or diffusion model weights, following
-  prior work to speed up training". The teacher and student have different
-  architectures here (three time embeddings versus one), so weights cannot be
-  copied directly; the `r = 0` end of the tangent warmup partially substitutes
-  by starting the objective as velocity distillation, but it is not equivalent.
+- **The scratch student is randomly initialized.** The paper initializes "the
+  student model with pretrained flow matching or diffusion model weights,
+  following prior work to speed up training". Our scratch arms start from
+  random weights; the `r = 0` end of tangent warmup starts the objective as
+  velocity distillation, but is not equivalent to teacher initialization. The
+  RF teacher-init variant instead trains a teacher with the student's interval
+  architecture and copies its weights into the student. The EDM arm retains a
+  scratch student because its current denoiser and student have different
+  architectures.
 
 Autoguidance and the guidance-weight conditioning `lambda` in Algorithm 1 are
 also absent, which is immaterial here because this benchmark has no

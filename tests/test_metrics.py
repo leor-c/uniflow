@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from toy.datasets import branching_trees
 from toy.common import (
     _uniform_subsample_rows,
     clean_support_distance,
@@ -68,6 +69,28 @@ class DensityMetricTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(off_support_rate("two_moons", points), 1.0 / 3.0)
+
+    def test_branching_trees_are_seeded_and_exactly_on_segments(self):
+        first = branching_trees(512, generator=torch.Generator().manual_seed(7))
+        again = branching_trees(512, generator=torch.Generator().manual_seed(7))
+
+        torch.testing.assert_close(first, again)
+        self.assertTrue((first[:, 0] < 0).any())
+        self.assertTrue((first[:, 0] > 0).any())
+        self.assertLess(
+            clean_support_distance("branching_trees", first).max().item(), 1e-6
+        )
+
+    def test_branching_tree_metrics_penalize_points_off_branches(self):
+        on_tree = torch.tensor([[-0.1, 0.0]]).repeat(32, 1)
+        off_tree = torch.tensor([[0.0, 0.7]]).repeat(32, 1)
+
+        self.assertLess(
+            target_negative_log_likelihood("branching_trees", on_tree),
+            target_negative_log_likelihood("branching_trees", off_tree),
+        )
+        self.assertEqual(off_support_rate("branching_trees", on_tree), 0.0)
+        self.assertEqual(off_support_rate("branching_trees", off_tree), 1.0)
 
     def test_ordered_modes_are_uniformly_subsampled(self):
         ordered_modes = torch.cat(

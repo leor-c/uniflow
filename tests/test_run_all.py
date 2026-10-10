@@ -47,6 +47,7 @@ def _args(**overrides):
         teacher_lr=None, teacher_final_lr=None, teacher_lr_drop_step=None,
         student_lr=None, student_final_lr=None, student_lr_drop_step=None,
         ae_ff_scale=None, teacher_ff_scale=None, student_ff_scale=None,
+        shared_teacher=False,
     )
     unknown = set(overrides) - set(fields)
     assert not unknown, f"unknown run_all flag(s): {sorted(unknown)}"
@@ -88,6 +89,28 @@ class RunAllAggregationTests(unittest.TestCase):
                 self.assertIsNone(_load_seed_metrics("8gaussians", 1, _args(teacher_final_lr=5e-5)))
                 self.assertIsNone(_load_seed_metrics("8gaussians", 1, _args(student_steps=20000)))
                 self.assertIsNone(_load_seed_metrics("8gaussians", 1, _args(teacher_lr_drop_step=-1)))
+
+    def test_shared_teacher_applies_only_to_rf_and_keeps_edm_reference(self):
+        from toy.run_all import PIPELINE_MODULES, _seed_metrics_path
+        args = _args(shared_teacher=True)
+        for pipeline, (module, teacher_field, student_field) in PIPELINE_MODULES.items():
+            cfg = _apply_overrides(
+                module.Config(device="cpu"), args, seed=2,
+                teacher_field=teacher_field, student_field=student_field,
+            )
+            if pipeline == "edm_ayf":
+                self.assertFalse(hasattr(cfg, "shared_teacher"))
+                self.assertEqual(
+                    str(_seed_metrics_path(pipeline, "branching_trees", 2, args)),
+                    "results/toy/branching_trees/edm_ayf/seed_2/metrics.json",
+                )
+            else:
+                self.assertTrue(cfg.shared_teacher)
+                self.assertEqual(
+                    str(_seed_metrics_path(pipeline, "branching_trees", 2, args)),
+                    f"results/toy/branching_trees/{pipeline}/experiments/"
+                    "shared_teacher_40k_40k/seed_2/metrics.json",
+                )
 
     def test_shared_overrides_include_latent_dimension(self):
         cfg = _Config()
@@ -308,6 +331,14 @@ class RunAllAggregationTests(unittest.TestCase):
         self.assertIn("150.0% ± 70.7%", report)
         self.assertIn("Aggregate target-NLL comparison", report)
         self.assertIn("summary.json", report)
+
+        tree_summary = _aggregate(all_metrics, "branching_trees")
+        tree_report = _render_markdown_summary(tree_summary, "branching_trees")
+        self.assertEqual(
+            tree_summary["off_support_threshold"], "three evaluation bandwidths"
+        )
+        self.assertIn("smoothed-line", tree_summary["evaluation_protocol"])
+        self.assertIn("samples are drawn exactly on the branches", tree_report)
 
     def test_current_schema_rejects_mmd_metrics(self):
         old = {

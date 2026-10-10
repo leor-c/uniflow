@@ -1,6 +1,7 @@
 """
 Run the three release benchmark arms: Uniform RF + AYF, Gaussian RF + AYF,
-and EDM + AYF.
+and EDM + AYF. With --teacher-init, the RF students start from their
+teachers, while EDM remains a scratch-initialized reference.
 
 Each experiment uses its own default Config. The --dataset, --seed/--seeds,
 --latent_dim, --ae_steps, --student_steps, and --teacher_steps flags are
@@ -32,9 +33,10 @@ from toy.outputs import RESULTS_ROOT, run_directory
 from toy.lr_schedule import add_lr_arguments, apply_lr_overrides
 from toy.common import (
     BENCHMARK_PROTOCOL,
-    DENSITY_PROTOCOL,
+    evaluation_protocol,
     DENSITY_SAMPLES,
     TARGET_NOISE_SCALES,
+    TARGET_EVALUATION_BANDWIDTHS,
     save_metrics,
     run_config_record,
 )
@@ -106,71 +108,69 @@ def _apply_overrides(cfg, args, seed: int, *, teacher_field: str, student_field:
     if args.student_steps is not None:
         setattr(cfg, student_field, args.student_steps)
     apply_lr_overrides(cfg, args, teacher_lr_field=teacher_field.replace("_steps", "_lr"))
-    # The shared-architecture teacher initializes the student from the teacher's
-    # weights, which only the two RF arms can do -- the EDM arm's teacher is a
-    # denoiser, not a velocity field with the student's architecture. Enabling
-    # it for some arms and not others would make this benchmark a comparison of
-    # student initializations rather than of base distributions, so the
-    # cross-arm runner refuses it outright. Single-arm studies reach it through
-    # `python -m toy.uniform_rf --shared-teacher`.
-    if getattr(cfg, "shared_teacher", False):
-        raise ValueError(
-            "shared_teacher is enabled on a cross-arm benchmark run. The EDM "
-            "arm cannot honor it, so the arms would no longer share a "
-            "methodology. Run the arms individually if that is what you want."
-        )
+    # EDM has a denoising teacher, so only the two RF arms can copy teacher
+    # weights into the student. The EDM arm remains a scratch reference.
+    if hasattr(cfg, "shared_teacher"):
+        cfg.shared_teacher = getattr(args, "shared_teacher", False)
     return cfg
 
 
-def _seed_metrics_path(pipeline: str, dataset: str, seed: int) -> Path:
+def _seed_metrics_path(pipeline: str, dataset: str, seed: int, args=None) -> Path:
+    if getattr(args, "shared_teacher", False) and pipeline != "edm_ayf":
+        return (RESULTS_ROOT / dataset / pipeline / "experiments" /
+                "shared_teacher_40k_40k" / f"seed_{seed}" / "metrics.json")
     return run_directory(dataset, pipeline, seed) / "metrics.json"
 
 
-def _seed_metrics_pattern(pipeline: str, seed: int) -> str:
-    return str(_seed_metrics_path(pipeline, "{}", seed))
+def _seed_metrics_pattern(pipeline: str, seed: int, args=None) -> str:
+    return str(_seed_metrics_path(pipeline, "{}", seed, args))
 
 
 def _configure_multi_seed_outputs(cfg, pipeline: str, seed: int, args) -> None:
-    cfg.metrics_out = _seed_metrics_pattern(pipeline, seed)
+    metrics_path = _seed_metrics_path(pipeline, cfg.dataset, seed, args)
+    cfg.metrics_out = _seed_metrics_pattern(pipeline, seed, args)
     cfg.save_figure = args.plot_all_seeds or seed == args.plot_seed
-    cfg.out_dir = str(run_directory(cfg.dataset, pipeline, seed))
-    cfg.out = str(Path(cfg.out_dir) / "samples.png")
+    cfg.out_dir = str(metrics_path.parent)
+    cfg.out = str(metrics_path.parent / "samples.png")
 
 
-def _has_current_metric_schema(metrics: dict) -> bool:
+def _has_current_metric_schema(metrics: dict, dataset: str | None = None) -> bool:
     return all(
         REQUIRED_METRIC_KEYS.issubset(pipeline_metrics)
         and pipeline_metrics.get("benchmark_protocol") == BENCHMARK_PROTOCOL
-        and pipeline_metrics.get("evaluation_protocol") == DENSITY_PROTOCOL
+        and pipeline_metrics.get("evaluation_protocol") == evaluation_protocol(dataset)
         for pipeline_metrics in metrics.values()
     )
 
 
+def _load_pipeline_metrics(pipeline: str, dataset: str, seed: int, args=None):
+    path = _seed_metrics_path(pipeline, dataset, seed, args)
+    if not path.is_file():
+        return None
+    metrics = json.loads(path.read_text())
+    if (not REQUIRED_METRIC_KEYS.issubset(metrics)
+            or metrics.get("benchmark_protocol") != BENCHMARK_PROTOCOL
+            or metrics.get("evaluation_protocol") != evaluation_protocol(dataset)):
+        return None
+    module, teacher_field, student_field = PIPELINE_MODULES[pipeline]
+    cfg = module.Config(dataset=dataset, seed=seed)
+    if args is not None:
+        _apply_overrides(cfg, args, seed, teacher_field=teacher_field,
+                         student_field=student_field)
+    expected = run_config_record(cfg)
+    saved = metrics.get("run_config", {})
+    if any(key not in saved or saved[key] != value
+           for key, value in expected.items() if key != "log_every"):
+        return None
+    return metrics
+
+
 def _load_seed_metrics(dataset: str, seed: int, args=None):
-    paths = {
-        pipeline: _seed_metrics_path(pipeline, dataset, seed)
+    metrics = {
+        pipeline: _load_pipeline_metrics(pipeline, dataset, seed, args)
         for pipeline in PIPELINES
     }
-    if not all(path.is_file() for path in paths.values()):
-        return None
-    metrics = {
-        pipeline: json.loads(path.read_text())
-        for pipeline, path in paths.items()
-    }
-    if not _has_current_metric_schema(metrics):
-        return None
-    # Protocol alone cannot distinguish current runs with different LR/step
-    # overrides. Compare all recorded result-determining settings as well.
-    for pipeline, (module, teacher_field, student_field) in PIPELINE_MODULES.items():
-        cfg = module.Config(dataset=dataset, seed=seed)
-        if args is not None:
-            _apply_overrides(cfg, args, seed, teacher_field=teacher_field,
-                             student_field=student_field)
-        expected = run_config_record(cfg)
-        saved = metrics[pipeline].get("run_config", {})
-        if any(key not in saved or saved[key] != value for key, value in expected.items()):
-            return None
-    return metrics
+    return metrics if all(value is not None for value in metrics.values()) else None
 
 
 def _run_seed(args, seed: int, *, multi_seed: bool):
@@ -184,13 +184,25 @@ def _run_seed(args, seed: int, *, multi_seed: bool):
             module.Config(), args, seed,
             teacher_field=teacher_field, student_field=student_field,
         )
-        if multi_seed or args.plot_all_seeds:
+        if multi_seed or args.plot_all_seeds or args.shared_teacher:
             _configure_multi_seed_outputs(cfg, pipeline, seed, args)
+        if args.resume or (args.shared_teacher and pipeline == "edm_ayf"):
+            saved = _load_pipeline_metrics(pipeline, cfg.dataset, seed, args)
+            if saved is not None:
+                print(f"Reusing {pipeline} metrics for seed {seed}")
+                metrics[pipeline] = saved
+                continue
+            if args.shared_teacher and pipeline == "edm_ayf":
+                raise FileNotFoundError(
+                    f"EDM scratch reference missing or configuration mismatch: "
+                    f"{_seed_metrics_path(pipeline, cfg.dataset, seed, args)}"
+                )
         metrics[pipeline] = module.main(cfg)
     return metrics
 
 
-def _aggregate(all_metrics: dict[int, dict]) -> dict:
+def _aggregate(all_metrics: dict[int, dict], dataset: str | None = None,
+               teacher_init: bool = False) -> dict:
     seeds = sorted(all_metrics)
     aggregate = {}
     for pipeline in PIPELINES:
@@ -210,15 +222,24 @@ def _aggregate(all_metrics: dict[int, dict]) -> dict:
     return {
         "num_seeds": len(seeds),
         "seeds": seeds,
+        "teacher_init": teacher_init,
         "metric": "two-sided density fidelity and coverage",
         "metric_samples": DENSITY_SAMPLES,
         "metric_sampling": "uniform without replacement",
-        "target_density": "known analytic mixture (arc mixture by midpoint quadrature)",
+        "target_density": (
+            "arc-length tree measure with evaluation-only Gaussian smoothing"
+            if dataset == "branching_trees"
+            else "known analytic mixture (arc mixture by midpoint quadrature)"
+        ),
         "coverage_density": "generated-sample isotropic Gaussian KDE",
         "target_noise_scales": TARGET_NOISE_SCALES,
-        "off_support_threshold": "three target noise scales",
+        "evaluation_bandwidths": TARGET_EVALUATION_BANDWIDTHS,
+        "off_support_threshold": (
+            "three evaluation bandwidths"
+            if dataset == "branching_trees" else "three target noise scales"
+        ),
         "benchmark_protocol": BENCHMARK_PROTOCOL,
-        "evaluation_protocol": DENSITY_PROTOCOL,
+        "evaluation_protocol": evaluation_protocol(dataset),
         "std_definition": "sample standard deviation (n - 1 denominator)",
         "pipelines": aggregate,
     }
@@ -258,17 +279,35 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
     seeds = ", ".join(str(seed) for seed in summary["seeds"])
     dataset_title = dataset.replace("8gaussians", "8-Gaussians").replace("_", " ")
 
+    density_description = (
+        "For branching trees, target NLL uses Gaussian smoothing only for evaluation; "
+        "samples are drawn exactly on the branches. Off-support uses three evaluation "
+        f"bandwidths ({3.0 * TARGET_EVALUATION_BANDWIDTHS[dataset]:g}) as its distance threshold."
+        if dataset == "branching_trees"
+        else "Generated-sample NLL uses the known target density. Off-support is the "
+        "fraction farther than three target noise scales "
+        f"({3.0 * TARGET_NOISE_SCALES[dataset]:g}) from clean support."
+    )
+
     lines = [
         f"# {dataset_title} benchmark results",
         "",
         f"Aggregated over **{summary['num_seeds']} seeds** ({seeds}). Values are mean ± sample",
-        f"standard deviation on {DENSITY_SAMPLES:,} uniformly sampled points. Fidelity is",
-        "generated-sample NLL under the known target density; coverage is held-out target",
-        "NLL under a generated-sample KDE. Off-support is the fraction farther than three",
-        f"target noise scales ({3.0 * TARGET_NOISE_SCALES[dataset]:g}) from clean support.",
+        f"standard deviation on {DENSITY_SAMPLES:,} uniformly sampled points.",
+        density_description,
+        "Coverage is held-out target NLL under a generated-sample KDE.",
         "All metrics are lower-is-better and should be interpreted together.",
         "",
     ]
+    if summary.get("teacher_init"):
+        lines.extend([
+            "Uniform RF and Gaussian RF students start from their respective",
+            "teachers. EDM remains a scratch-initialized reference because its",
+            "denoising teacher weights cannot be copied into the current student.",
+            "The teacher-init variant also changes the RF teacher architecture,",
+            "so this is not an isolated test of weight initialization.",
+            "",
+        ])
 
     for output_prefix in output_prefixes:
         lines.extend(
@@ -351,15 +390,15 @@ def _render_markdown_summary(summary: dict, dataset: str) -> str:
     return "\n".join(lines)
 
 
-def _save_markdown_summary(summary: dict, dataset: str) -> Path:
-    path = RESULTS_ROOT / dataset / "summary.md"
+def _save_markdown_summary(summary: dict, dataset: str, output_dir: Path | None = None) -> Path:
+    path = (output_dir or RESULTS_ROOT / dataset) / "summary.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_render_markdown_summary(summary, dataset))
     print(f"Saved Markdown report -> {path}")
     return path
 
 
-def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
+def _save_aggregate_plot(summary: dict, dataset: str, output_dir: Path | None = None) -> Path:
     output_prefixes = _report_output_prefixes(summary)
     group_positions = list(range(len(output_prefixes)))
     width = 0.24
@@ -422,7 +461,7 @@ def _save_aggregate_plot(summary: dict, dataset: str) -> Path:
     ax.legend(frameon=False, loc="best")
     fig.tight_layout()
 
-    path = RESULTS_ROOT / dataset / "summary.png"
+    path = (output_dir or RESULTS_ROOT / dataset) / "summary.png"
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
@@ -445,7 +484,7 @@ def _worker_count(cuda_available: bool, pending_seeds: int, requested: int | Non
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default=None,
-                    choices=["8gaussians", "two_moons", "checkerboard"])
+                    choices=["8gaussians", "two_moons", "checkerboard", "branching_trees"])
     seed_group = ap.add_mutually_exclusive_group()
     seed_group.add_argument("--seed", type=int, default=None)
     seed_group.add_argument("--seeds", type=int, nargs="+", default=None)
@@ -497,6 +536,11 @@ def main():
     ap.add_argument("--ae-steps", type=int, default=None)
     ap.add_argument("--teacher-steps", type=int, default=None)
     ap.add_argument("--student-steps", type=int, default=None)
+    ap.add_argument("--teacher-init", dest="shared_teacher", action="store_true",
+                    help="Initialize RF students from their teachers; use the existing "
+                         "scratch EDM run as reference. Save results separately.")
+    ap.add_argument("--shared-teacher", dest="shared_teacher", action="store_true",
+                    help=argparse.SUPPRESS)
     add_lr_arguments(ap)
     args = ap.parse_args()
     if args.plot_all_seeds and args.resume:
@@ -559,11 +603,13 @@ def main():
         for seed in pending_seeds:
             all_metrics[seed] = _run_seed(args, seed, multi_seed=multi_seed)
 
-    aggregate = _aggregate(all_metrics)
+    aggregate = _aggregate(all_metrics, dataset, teacher_init=args.shared_teacher)
     summary = aggregate if multi_seed else all_metrics[seeds[0]]
-    save_metrics(summary, str(RESULTS_ROOT / dataset / "summary.json"))
-    _save_aggregate_plot(aggregate, dataset)
-    _save_markdown_summary(aggregate, dataset)
+    output_dir = (RESULTS_ROOT / dataset / "experiments" / "shared_teacher_40k_40k"
+                  if args.shared_teacher else RESULTS_ROOT / dataset)
+    save_metrics(summary, str(output_dir / "summary.json"))
+    _save_aggregate_plot(aggregate, dataset, output_dir)
+    _save_markdown_summary(aggregate, dataset, output_dir)
 
 
 if __name__ == "__main__":

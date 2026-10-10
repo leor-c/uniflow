@@ -231,7 +231,7 @@ def main(cfg: Config | None = None):
         ap = argparse.ArgumentParser()
         ap.add_argument(
             "--dataset", default="8gaussians",
-            choices=["8gaussians", "two_moons", "checkerboard"],
+            choices=["8gaussians", "two_moons", "checkerboard", "branching_trees"],
         )
         ap.add_argument("--latent-dim", type=int, default=None)
         ap.add_argument("--teacher-steps", type=int, default=None)

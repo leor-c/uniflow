@@ -1,12 +1,12 @@
 # UniFlow
 
-Diffusion and flow models predominantly use Gaussian noise, which requires rescaling the latents to match its fixed unit scale. This can be limiting in settings where the latent representations are evolving (e.g., online learning), since it requires re-estimation of the scale which requires computing the latents over a significant data subset with the model frozen.
+Diffusion and flow models predominantly use Gaussian noise, commonly paired with latent rescaling to match its unit scale. When latent representations evolve (e.g., during online learning), a fixed calibration can become stale. Online estimates can track these changes, but introduce normalization state and update-rate choices.
 
-This repo studies an alternative: uniform noise on [-1, 1] paired with tanh-bounded latents (a tanh applied to the encoder output). The latent space is naturally aligned with the noise cube, avoiding the need for post-training rescaling.
+This repo studies an alternative: uniform noise on [-1, 1] paired with tanh-bounded latents (a tanh applied to the encoder output). The latent support lies inside the noise cube, avoiding the need for post-training rescaling. This does not guarantee that encoded data fill the cube or have stable moments as the encoder evolves.
 
 The study uses 1-Rectified Flow (RF) and compares the standard Gaussian noise baseline against the uniform noise variant, with an EDM baseline included for reference. It also evaluates Align Your Flow (AYF) distillation, training an AYF student for each baseline.
 
-This idea was used in my [Horizon Imagination](https://github.com/leor-c/horizon-imagination) paper in a complex visual RF world model. The paper and code provide further evidence for the performance of this approach at scale in a realistic online RL setting.
+The uniform noise + tanh latents idea started in [Horizon Imagination](https://github.com/leor-c/horizon-imagination), where it was used in a complex visual RF world model. The paper and code provide further evidence for the performance of this approach at scale in a realistic online RL setting.
 
 ---
 
@@ -110,7 +110,8 @@ are listed in the comparison table above.
 Fourier features help the networks represent sharp changes in the 2D flow
 field. LMD is the default distillation objective for the toy benchmark; image
 extensions use separate settings. The LMD implementation uses the Boffi et al.
-form, and students are randomly initialized; see
+form. Scratch students start from random weights; the RF teacher-init
+variant starts from trained teacher weights. See
 [Known deviations from the paper](BENCHMARK_DETAILS.md#known-deviations-from-the-paper).
 
 See [Reproduce](#reproduce) for installation and run commands, and
@@ -120,20 +121,116 @@ image-specific settings.
 
 ## Results
 
-Results below cover **8-Gaussians** and **two moons**, each evaluated over five
-seeds (1–5). Values are mean ± sample standard deviation; lower is better.
-Fidelity measures generated-sample NLL under the target density, coverage
-measures held-out target NLL under a generated-sample KDE, and off-support
-measures the fraction of samples more than three noise scales from the clean
-modes or arcs. Interpret these metrics together.
+Results below cover **branching trees**, **8-Gaussians**, and **two moons**,
+each evaluated over five seeds (1–5). Values are mean ± sample standard
+deviation; lower is better. Target NLL measures sample fidelity, coverage is
+held-out target NLL under a generated-sample KDE, and off-support measures how
+often samples stray from the clean data geometry. For branching trees, samples
+lie exactly on line segments; target NLL uses Gaussian smoothing during
+evaluation only.
+
+The branching-trees comparison shows both RF student initializations. We lead
+with **teacher init**, the variant intended for downstream use: each RF student
+starts from its trained RF teacher. EDM remains a scratch-initialized reference.
+The teacher-init option also changes the RF teacher architecture, so
+comparisons with scratch do not isolate weight copying alone. The
+8-Gaussians and two-moons results below are scratch-only runs.
 
 See the [evaluation appendix](BENCHMARK_DETAILS.md#evaluation-protocol-and-result-history) for
 metric details and [Reproduce](#reproduce) for run commands.
 
-### 8-Gaussians
+### Branching trees
 
 <details open>
-<summary>Show results and figures</summary>
+<summary>Teacher-init results and figures (RF); EDM scratch reference</summary>
+
+Seed 1 sample panels show target data, autoencoder reconstructions, teacher ODE
+samples, and one- and eight-step AYF students.
+
+**Gaussian RF + AYF, teacher init**
+
+![Branching trees: Gaussian RF teacher-init samples](results/toy/branching_trees/gaussian_rf/experiments/shared_teacher_40k_40k/seed_1/samples.png)
+
+**Uniform RF + AYF, teacher init**
+
+![Branching trees: Uniform RF teacher-init samples](results/toy/branching_trees/uniform_rf/experiments/shared_teacher_40k_40k/seed_1/samples.png)
+
+**EDM + AYF, scratch reference**
+
+![Branching trees: EDM scratch-reference samples](results/toy/branching_trees/edm_ayf/seed_1/samples.png)
+
+**Quantitative results**
+
+| Model | Arm | Target NLL ↓ | Coverage NLL ↓ | Off support ↓ |
+|---|---|---:|---:|---:|
+| Teacher | Gaussian RF + AYF | -0.954 ± 0.130 | -0.991 ± 0.045 | 0.4% ± 0.1% |
+| Teacher | Uniform RF + AYF | -0.956 ± 0.097 | -0.951 ± 0.061 | 0.5% ± 0.2% |
+| Teacher | EDM + AYF | -0.496 ± 0.094 | -0.745 ± 0.045 | 2.5% ± 0.6% |
+| Student, 1 step | Gaussian RF + AYF | -0.017 ± 0.195 | -0.871 ± 0.036 | 3.2% ± 0.5% |
+| Student, 1 step | Uniform RF + AYF | -0.055 ± 0.349 | -0.825 ± 0.055 | 3.4% ± 0.7% |
+| Student, 1 step | EDM + AYF | 0.703 ± 0.444 | -0.708 ± 0.039 | 5.5% ± 0.9% |
+| Student, 8 steps | Gaussian RF + AYF | -0.565 ± 0.063 | -0.902 ± 0.026 | 3.0% ± 0.5% |
+| Student, 8 steps | Uniform RF + AYF | -0.384 ± 0.066 | -0.843 ± 0.055 | 3.5% ± 0.3% |
+| Student, 8 steps | EDM + AYF | -0.014 ± 0.080 | -0.687 ± 0.021 | 5.4% ± 0.4% |
+
+Compared with scratch, teacher init improves all six student metrics on average
+for Uniform RF. Gaussian RF has smaller, mixed changes: its 8-step target and
+coverage NLL improve, while 1-step coverage and 8-step off-support are
+slightly worse.
+
+**Aggregate target-NLL comparison**
+
+<img src="results/toy/branching_trees/experiments/shared_teacher_40k_40k/summary.png" alt="Branching trees five-seed teacher-init comparison" width="800">
+
+[Five-seed teacher-init comparison with scratch](results/toy/branching_trees/experiments/shared_teacher_40k_40k/COMPARISON.md) · [Teacher-init per-seed values](results/toy/branching_trees/experiments/shared_teacher_40k_40k/summary.json)
+
+</details>
+
+<details>
+<summary>Scratch results and figures</summary>
+
+Seed 1 scratch sample panels use the same layout. The EDM reference is identical
+to the one above. All students train from random weights with the same 80k
+schedule as the teacher-init runs.
+
+**Gaussian RF + AYF, scratch**
+
+![Branching trees: Gaussian RF scratch samples](results/toy/branching_trees/gaussian_rf/seed_1/samples.png)
+
+**Uniform RF + AYF, scratch**
+
+![Branching trees: Uniform RF scratch samples](results/toy/branching_trees/uniform_rf/seed_1/samples.png)
+
+**EDM + AYF, scratch reference**
+
+![Branching trees: EDM scratch-reference samples](results/toy/branching_trees/edm_ayf/seed_1/samples.png)
+
+**Quantitative results**
+
+| Model | Arm | Target NLL ↓ | Coverage NLL ↓ | Off support ↓ |
+|---|---|---:|---:|---:|
+| Teacher | Gaussian RF + AYF | -1.027 ± 0.057 | -1.014 ± 0.048 | 0.3% ± 0.1% |
+| Teacher | Uniform RF + AYF | -0.994 ± 0.066 | -0.981 ± 0.043 | 0.5% ± 0.2% |
+| Teacher | EDM + AYF | -0.496 ± 0.094 | -0.745 ± 0.045 | 2.5% ± 0.6% |
+| Student, 1 step | Gaussian RF + AYF | 0.001 ± 0.295 | -0.876 ± 0.043 | 3.3% ± 0.4% |
+| Student, 1 step | Uniform RF + AYF | 0.233 ± 0.328 | -0.736 ± 0.052 | 4.0% ± 0.3% |
+| Student, 1 step | EDM + AYF | 0.703 ± 0.444 | -0.708 ± 0.039 | 5.5% ± 0.9% |
+| Student, 8 steps | Gaussian RF + AYF | -0.533 ± 0.062 | -0.882 ± 0.034 | 3.0% ± 0.5% |
+| Student, 8 steps | Uniform RF + AYF | -0.084 ± 0.207 | -0.777 ± 0.057 | 5.2% ± 0.9% |
+| Student, 8 steps | EDM + AYF | -0.014 ± 0.080 | -0.687 ± 0.021 | 5.4% ± 0.4% |
+
+**Aggregate target-NLL comparison**
+
+<img src="results/toy/branching_trees/summary.png" alt="Branching trees five-seed scratch comparison" width="800">
+
+[Scratch report and AE reference](results/toy/branching_trees/summary.md) · [Scratch per-seed values](results/toy/branching_trees/summary.json)
+
+</details>
+
+### 8-Gaussians
+
+<details>
+<summary>Scratch results and figures</summary>
 
 Seed 1 sample panels show target data, autoencoder reconstructions, teacher ODE
 samples, and one- and eight-step AYF students.
@@ -174,8 +271,8 @@ samples, and one- and eight-step AYF students.
 
 ### Two moons
 
-<details open>
-<summary>Show results and figures</summary>
+<details>
+<summary>Scratch results and figures</summary>
 
 Seed 1 sample panels show target data, autoencoder reconstructions, teacher ODE
 samples, and one- and eight-step AYF students.
@@ -214,6 +311,16 @@ samples, and one- and eight-step AYF students.
 
 </details>
 
+## Evolving-encoder experiment
+
+A separate [branching-tree benchmark](ONLINE_BENCHMARK.md) compares Uniform RF,
+Gaussian RF with fixed calibration, and Gaussian RF with EMA normalization while
+the AE keeps training. It includes forward/reverse expanding-support schedules
+and a stationary control. Run it with `python -m toy.online`; this experiment
+is separate from the offline tables above. The original short-budget pilot
+was underfit; see the [long-schedule convergence check](results/toy/branching_trees/online_convergence/REPORT.md)
+for the corrected training budget and its one-seed results.
+
 ## Reproduce
 
 Python 3.10 or newer is required.
@@ -227,7 +334,24 @@ python -m toy.run_all
 
 The default command reruns the five-seed benchmark while keeping seed 1 as the
 only qualitative figure. Use `--dataset two_moons` to run the two-moons
-benchmark. When CUDA is available, the seed runs execute in parallel spawned processes; each worker
+benchmark. `--dataset branching_trees` runs a pair of mirrored branching trees:
+training samples lie exactly on their line segments, with no added noise.
+The target-NLL metric smooths the tree geometry only during evaluation because
+a line distribution has no two-dimensional density.
+
+To reproduce the paired branching-trees comparison, run the scratch benchmark
+first so the EDM reference exists, then run the RF teacher-init variant:
+
+```bash
+python -m toy.run_all --dataset branching_trees --seeds 1 2 3 4 5 --workers 2
+python -m toy.run_all --dataset branching_trees --seeds 1 2 3 4 5 --teacher-init --resume --workers 2
+```
+
+The second command reuses the EDM scratch metrics and writes the RF teacher-init
+results to a separate experiment directory. Both commands use the default 80k
+teacher and student schedules: 40k steps at `1e-3`, then 40k at `1e-4`.
+
+When CUDA is available, the seed runs execute in parallel spawned processes; each worker
 runs the three pipelines for its seed sequentially. By default, one worker is
 used per seed. Limit GPU memory use with `--workers N`, or pass `--workers 1`
 for sequential execution. CPU runs remain sequential.

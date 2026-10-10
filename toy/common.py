@@ -15,10 +15,16 @@ import torch.nn.functional as F
 
 from core.modules import MLP, RandomFourierFeatures
 from core.seeding import stream_generator
-from toy.datasets import get_sampler
+from toy.datasets import branching_tree_quadrature, branching_tree_segments, get_sampler
 
 DENSITY_SAMPLES = 2048
 DENSITY_PROTOCOL = "exact-target-nll-kde-coverage-three-sigma-support-v1"
+TREE_DENSITY_PROTOCOL = "smoothed-line-target-nll-kde-coverage-v1"
+
+
+def evaluation_protocol(dataset: str | None) -> str:
+    return TREE_DENSITY_PROTOCOL if dataset == "branching_trees" else DENSITY_PROTOCOL
+
 # v7 gives every teacher/student the same 80k-update budget and 40k LR drop.
 # Old constant-LR results (including the 20k EDM student) must not be resumed.
 BENCHMARK_PROTOCOL = "global-scalar-latent-scale-edm-flow-matching-ayf-v7"
@@ -28,6 +34,7 @@ TARGET_NOISE_SCALES = {
     "two_moons": 0.05,
     "checkerboard": 0.12,
 }
+TARGET_EVALUATION_BANDWIDTHS = {**TARGET_NOISE_SCALES, "branching_trees": 0.012}
 TWO_MOONS_QUADRATURE_POINTS = 2048
 
 
@@ -271,6 +278,8 @@ def _fixed_target_components(dataset: str) -> tuple[torch.Tensor, float]:
             ],
             dtype=torch.float64,
         )
+    elif dataset == "branching_trees":
+        centers = branching_tree_quadrature()
     elif dataset == "two_moons":
         t = (
             torch.arange(TWO_MOONS_QUADRATURE_POINTS, dtype=torch.float64) + 0.5
@@ -283,7 +292,7 @@ def _fixed_target_components(dataset: str) -> tuple[torch.Tensor, float]:
         centers = torch.cat([first, second], dim=0)
     else:
         raise ValueError(f"Unknown toy dataset: {dataset}")
-    return centers, TARGET_NOISE_SCALES[dataset]
+    return centers, TARGET_EVALUATION_BANDWIDTHS[dataset]
 
 
 def _gaussian_mixture_log_density(
@@ -323,7 +332,11 @@ def target_negative_log_likelihood(
     generated: torch.Tensor,
     samples: int = DENSITY_SAMPLES,
 ) -> float:
-    """Generated-sample NLL under the known toy target density (fidelity)."""
+    """Generated-sample NLL under the target density.
+
+    The noise-free branching trees use an evaluation-only Gaussian smoothing
+    scale because a line distribution has no 2D Lebesgue density.
+    """
     _validate_sample_matrix(generated, "target NLL")
     generated = _uniform_subsample_rows(
         generated.detach().cpu(), min(len(generated), samples), seed=0
@@ -350,7 +363,7 @@ def kde_coverage_negative_log_likelihood(
     log_density = _gaussian_mixture_log_density(
         real,
         generated,
-        TARGET_NOISE_SCALES[dataset],
+        TARGET_EVALUATION_BANDWIDTHS[dataset],
     )
     return -log_density.mean().item()
 
@@ -385,6 +398,16 @@ def clean_support_distance(dataset: str, points: torch.Tensor) -> torch.Tensor:
     points = points.detach().cpu().double()
     if dataset == "two_moons":
         return _two_moons_support_distance(points)
+    if dataset == "branching_trees":
+        segments = branching_tree_segments()
+        starts, directions = segments[:, 0], segments[:, 1] - segments[:, 0]
+        offsets = points[:, None, :] - starts[None, :, :]
+        fractions = (
+            (offsets * directions[None, :, :]).sum(dim=2)
+            / directions.square().sum(dim=1)[None, :]
+        ).clamp(0.0, 1.0)
+        nearest = starts[None, :, :] + fractions[:, :, None] * directions[None, :, :]
+        return (points[:, None, :] - nearest).norm(dim=2).min(dim=1).values
     centers, _ = _fixed_target_components(dataset)
     return torch.cdist(points, centers).min(dim=1).values
 
@@ -395,12 +418,12 @@ def off_support_rate(
     generated: torch.Tensor,
     samples: int = DENSITY_SAMPLES,
 ) -> float:
-    """Fraction farther than three target noise scales from clean support."""
+    """Fraction farther than three evaluation bandwidths from clean support."""
     _validate_sample_matrix(generated, "off-support rate")
     generated = _uniform_subsample_rows(
         generated.detach().cpu(), min(len(generated), samples), seed=0
     )
-    threshold = 3.0 * TARGET_NOISE_SCALES[dataset]
+    threshold = 3.0 * TARGET_EVALUATION_BANDWIDTHS[dataset]
     return (clean_support_distance(dataset, generated) > threshold).double().mean().item()
 
 
@@ -412,7 +435,7 @@ def evaluate_density_outputs(
 ) -> dict[str, float | str]:
     metrics: dict[str, float | str] = {
         "benchmark_protocol": BENCHMARK_PROTOCOL,
-        "evaluation_protocol": DENSITY_PROTOCOL,
+        "evaluation_protocol": evaluation_protocol(dataset),
     }
     for output_name, generated in outputs.items():
         metrics[f"{output_name}_target_nll"] = target_negative_log_likelihood(

@@ -122,11 +122,9 @@ class Config:
     # --- Shared-architecture teacher --------------------------------------
     # Train the RF teacher as an RFIntervalFlowMap (velocity regression on its
     # slope at sampled s) and initialize the student with a full weight copy.
-    # Identical in meaning and default to toy.uniform_rf.Config.shared_teacher;
-    # both RF arms must be set the same way or the benchmark stops comparing
-    # base distributions. The EDM arm cannot honor it at all -- its teacher is
-    # an EDM denoiser, not a velocity field with the student's architecture --
-    # so toy.run_all refuses to run a cross-arm comparison with it enabled.
+    # Identical in meaning and default to toy.uniform_rf.Config.shared_teacher.
+    # The EDM arm cannot copy teacher weights into its current student, so
+    # toy.run_all includes its scratch result as a reference.
     shared_teacher: bool = False
 
     student_lr: float = 1e-3
@@ -246,7 +244,7 @@ def main(cfg: Config | None = None):
     if cfg is None:
         ap = argparse.ArgumentParser()
         ap.add_argument("--dataset", default="8gaussians",
-                        choices=["8gaussians", "two_moons", "checkerboard"])
+                        choices=["8gaussians", "two_moons", "checkerboard", "branching_trees"])
         ap.add_argument("--latent-dim", type=int, default=None)
         ap.add_argument("--teacher-steps", type=int, default=None)
         ap.add_argument("--student-steps", type=int, default=None)
@@ -254,10 +252,12 @@ def main(cfg: Config | None = None):
             "--train-mode", default="lmd", choices=["emd", "lmd", "emd+lmd"],
         )
         ap.add_argument("--lmd-weight", type=float, default=None)
-        ap.add_argument("--shared-teacher", action="store_true",
+        ap.add_argument("--teacher-init", dest="shared_teacher", action="store_true",
                         help="Train the RF teacher as an interval flow map and "
-                             "initialize the student from its weights. Must "
-                             "match the uniform arm; unavailable for EDM.")
+                             "initialize the student from its weights. EDM uses "
+                             "a scratch student as reference.")
+        ap.add_argument("--shared-teacher", dest="shared_teacher", action="store_true",
+                        help=argparse.SUPPRESS)
         ap.add_argument("--base-std", type=float, default=1.0)
         ap.add_argument(
             "--ae-ff-scale", type=float, default=None,
